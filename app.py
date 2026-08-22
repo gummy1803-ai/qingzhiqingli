@@ -374,69 +374,38 @@ data: dict[str, pd.DataFrame] = {}
 if use_builtin == "使用内置数据(自动扫描)":
     data = load_default_csvs()
 
-# 通用文件上传处理:按后缀分发到 CSV 合并 / Word 表格(标准耐久解析) / Excel 表格
-csv_parts: list[pd.DataFrame] = []
-docx_parts: list[pd.DataFrame] = []  # ✅ ② 耐久工步:标准宽表结构(stage_start_h/平均单体电压/净输出功率...列齐全)
-xls_parts: list[pd.DataFrame] = []   # ① 整车:带 Timestamp 的 Excel
-bench_parts: list[pd.DataFrame] = [] # ✅ ③ 台架循环:无 Timestamp 但含 循环/cycle/功率点 等关键词的 CSV/Excel
+# ============================================================
+# 📌 通用文件上传处理 —— 严格按后缀优先分类(与三大目录一一对应):
+#   .docx          → 100% 耐久工步       (目录 01_耐久原始数据处理)
+#   .csv 含 Timestamp → 整车数据         (目录 02_整车数据处理)
+#   .csv 无 Timestamp → 台架循环(命中关键词) (目录 03_台架耐久数据)
+#   .xlsx/.xls 同 CSV 规则(方便用户两种格式都能传)
+# ============================================================
+csv_parts: list[pd.DataFrame] = []    # ① 整车:含 Timestamp 的 CSV/Excel
+docx_parts: list[pd.DataFrame] = []   # ② 耐久工步:所有 .docx(100% 归入耐久衰减)
+xls_parts: list[pd.DataFrame] = []    # ① 整车:含 Timestamp 的 Excel(和 CSV 走同一路由)
+bench_parts: list[pd.DataFrame] = []  # ③ 台架循环:无 Timestamp 但含台架关键词
 
-def _classify_no_timestamp_df(df: pd.DataFrame, fname: str) -> tuple[str, str]:
-    """无 Timestamp 的表 → 三选一分类: '耐久工步' / '台架循环' / '未知'。
-    返回 (类别, 原因描述)。
+def _is_bench_dataframe(df: pd.DataFrame) -> tuple[bool, list[str]]:
+    """无 Timestamp 的表 → 判断是否为台架循环。
+    返回 (是否台架, 命中的关键词前4个)。
     """
     cols_lower = {str(c).lower() for c in df.columns}
-    # -------- 耐久工步(docx标准宽表)命中关键字 --------
-    dur_hits = [k for k in {"平均单体电压(v)", "净输出功率(kw)", "目标功率(kw)", "电堆电流(a)",
-                           "电压方差", "离均差", "hfr", "lfr", "空压机功耗", "水泵功耗",
-                           "冷却水入口温度(℃)", "冷却水出口温度(℃)"}
-               if k in cols_lower]
-    if len(dur_hits) >= 2 or ("stage_start_h" in cols_lower or "stage" in cols_lower) or re.search(r"耐久\d+-\d+", fname):
-        return "耐久工步", f"命中耐久关键字: {dur_hits[:3]} / 文件名匹配耐久XX-YY"
-    # -------- 台架循环命中关键字 --------
     bench_hits = [k for k in {"循环", "loop", "cycle", "循环编号", "循环次数", "功率点",
-                             "电流密度", "效率", "hydrogen利用率", "氢气利用率", "stack_voltage",
-                             "单体平均电压", "系统效率", "net_power", "net_efficiency", "spec_power_density"}
-                 if k in cols_lower]
-    if len(bench_hits) >= 2:
-        return "台架循环", f"命中台架循环关键字: {bench_hits[:4]}"
-    return "未知", "未命中耐久/台架关键词,跳过"
+                              "电流密度", "效率", "hydrogen利用率", "氢气利用率", "stack_voltage",
+                              "单体平均电压", "系统效率", "net_power", "net_efficiency", "spec_power_density"}
+                  if k in cols_lower]
+    return len(bench_hits) >= 2, bench_hits[:4]
 
 if uploaded_files:
     import tempfile
     for f in uploaded_files:
         suffix = Path(f.name).suffix.lower()
         try:
-            if suffix == ".csv":
-                df = pd.read_csv(f)
-                if "Timestamp" in df.columns:
-                    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-                    csv_parts.append(df)
-                else:
-                    # ✅ 不再直接跳过 → 先按「台架循环/耐久工步」分类
-                    _cls, _why = _classify_no_timestamp_df(df, f.name)
-                    if _cls == "耐久工步":
-                        # 补耐久标准列(stage/stage_start_h/step_idx),然后进 docx_parts
-                        if "stage" not in df.columns:
-                            df["stage"] = Path(f.name).stem
-                        if "stage_start_h" not in df.columns:
-                            m = re.search(r"耐久(\d+)-(\d+)", Path(f.name).stem)
-                            df["stage_start_h"] = int(m.group(1)) if m else 0
-                        if "step_idx" not in df.columns:
-                            df["step_idx"] = range(len(df))
-                        if "file" not in df.columns:
-                            df["file"] = f.name
-                        docx_parts.append(df)
-                        st.info(f"{f.name}: 自动识别为 **耐久工步** → 归入「耐久衰减」Tab ({_why})")
-                    elif _cls == "台架循环":
-                        if "file" not in df.columns:
-                            df["file"] = f.name
-                        bench_parts.append(df)
-                        st.info(f"{f.name}: 自动识别为 **台架循环** → 归入「🔬 台架耐久统计及预警」Tab ({_why})")
-                    else:
-                        st.warning(f"{f.name}: 缺 Timestamp 列,且未命中耐久/台架关键字,暂无法归类 → 请检查列名或格式({_why})")
-            elif suffix in (".doc", ".docx"):
-                # ✅ Word 文档:直接复用 load_durability_docx() 标准解析(会加 stage/stage_start_h/step_idx,
-                #    并产出「平均单体电压(V)、净输出功率(kW)」等标准宽表列 — 与内置 docx 加载结果一致)
+            # ------------------------------------------------------------
+            # ✅ 规则 1: .docx → 100% 耐久工步(走标准解析,不做任何关键词判断)
+            # ------------------------------------------------------------
+            if suffix in (".doc", ".docx"):
                 if suffix == ".doc":
                     st.warning(f"{f.name}: 旧版 .doc 格式不受支持,请另存为 .docx 后再上传")
                     continue
@@ -449,55 +418,51 @@ if uploaded_files:
                     if not tmp_df.empty:
                         tmp_df["file"] = f.name
                         docx_parts.append(tmp_df)
+                        st.info(f"{f.name}: 📉 **耐久工步数据** (.docx 按规则直接归入) → 「耐久衰减」Tab")
                 finally:
                     try:
                         Path(tmp_path).unlink(missing_ok=True)
                     except Exception:
                         pass
+                continue
+
+            # ------------------------------------------------------------
+            # ✅ 规则 2&3: .csv / .xlsx → 先看有没有 Timestamp(整车),否则看台架关键词
+            # ------------------------------------------------------------
+            if suffix == ".csv":
+                df = pd.read_csv(f)
             elif suffix in (".xls", ".xlsx"):
-                xls_df = pd.read_excel(io.BytesIO(f.read()))
-                if "Timestamp" in xls_df.columns:
-                    xls_df["Timestamp"] = pd.to_datetime(xls_df["Timestamp"], errors="coerce")
-                    xls_parts.append(xls_df)
-                else:
-                    # ✅ 无 Timestamp 的 Excel → 先分类(耐久工步 vs 台架循环)
-                    _cls, _why = _classify_no_timestamp_df(xls_df, f.name)
-                    if _cls == "耐久工步" or (re.search(r"耐久(\d+)-(\d+)", Path(f.name).stem)):
-                        # 耐久工步:缺标准列就补
-                        if "stage" not in xls_df.columns:
-                            xls_df["stage"] = Path(f.name).stem
-                        if "stage_start_h" not in xls_df.columns:
-                            m = re.search(r"耐久(\d+)-(\d+)", Path(f.name).stem)
-                            xls_df["stage_start_h"] = int(m.group(1)) if m else 0
-                        if "step_idx" not in xls_df.columns:
-                            xls_df["step_idx"] = range(len(xls_df))
-                        if "file" not in xls_df.columns:
-                            xls_df["file"] = f.name
-                        docx_parts.append(xls_df)
-                        st.info(f"{f.name}: 自动识别为 **耐久工步** → 归入「耐久衰减」Tab")
-                    elif _cls == "台架循环":
-                        if "file" not in xls_df.columns:
-                            xls_df["file"] = f.name
-                        bench_parts.append(xls_df)
-                        st.info(f"{f.name}: 自动识别为 **台架循环** → 归入「🔬 台架耐久统计及预警」Tab")
-                    else:
-                        # 兜底:不明类型 → 当耐久工步补充数据(至少能看到数据),同时打 warning
-                        if "stage" not in xls_df.columns:
-                            xls_df["stage"] = Path(f.name).stem
-                        if "stage_start_h" not in xls_df.columns:
-                            xls_df["stage_start_h"] = 0
-                        if "step_idx" not in xls_df.columns:
-                            xls_df["step_idx"] = range(len(xls_df))
-                        if "file" not in xls_df.columns:
-                            xls_df["file"] = f.name
-                        docx_parts.append(xls_df)
-                        st.warning(f"{f.name}: 未命中耐久/台架关键词 → 已作为耐久补充数据导入,请在「耐久衰减」Tab 里确认是否符合预期。({_why})")
+                df = pd.read_excel(io.BytesIO(f.read()))
             else:
                 st.warning(f"{f.name}: 不支持的格式 ({suffix})")
+                continue
+
+            if "Timestamp" in df.columns:
+                # ----- 有 Timestamp → 整车数据 -----
+                df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+                if suffix == ".csv":
+                    csv_parts.append(df)
+                else:
+                    xls_parts.append(df)
+                st.info(f"{f.name}: 🚗 **整车数据** (检测到 Timestamp 列) → 整车看板/燃电/性能等 8 个 Tab")
+            else:
+                # ----- 无 Timestamp → 仅判断台架循环(耐久不可能是 CSV/Excel) -----
+                _is_bench, _hits = _is_bench_dataframe(df)
+                if _is_bench:
+                    if "file" not in df.columns:
+                        df["file"] = f.name
+                    bench_parts.append(df)
+                    st.info(f"{f.name}: 🏭 **台架循环数据** (命中台架关键词 {_hits}) → 「🔬 台架耐久统计及预警」Tab")
+                else:
+                    st.warning(
+                        f"{f.name}: ❌ 无法归类\n\n"
+                        f"三大数据类型规则:\n"
+                        f"• 🚗 整车 → .csv 必须含 `Timestamp` 列(当前缺失)\n"
+                        f"• 📉 耐久 → 必须是 .docx(当前是 {suffix.upper()})\n"
+                        f"• 🏭 台架 → .csv 无 Timestamp 但需含「循环/功率点/效率」等台架关键词(当前未命中)\n"
+                    )
         except Exception as e:
-            tip = ""
-            if suffix == ".doc":
-                tip = " (旧版 .doc 格式不受支持,请另存为 .docx 后再上传)"
+            tip = " (旧版 .doc 格式不受支持,请另存为 .docx 后再上传)" if suffix == ".doc" else ""
             st.warning(f"{f.name} 解析失败{tip}: {e}")
             logger.warning("上传文件解析失败 %s: %s", f.name, e, exc_info=True)
 
@@ -707,9 +672,14 @@ if _bench_builtin_dir.exists() and use_builtin == "使用内置数据(自动扫�
         })
 
 if _recognized:
+    # ---------- 11 个 Tab 的固定顺序与索引(用于引导提示第几个) ----------
+    _TAB_ORDER = ["整车看板", "📈 性能统计预测", "耐久衰减", "🔬 台架耐久统计及预警",
+                  "📡 飞书人员对接", "多车对比", "报告导出", "AI 助手", "趋势预测",
+                  "⚡ 燃电运行看板", "🔌 绝缘阻值统计"]
+
     _jump_card = st.container(border=True)
     with _jump_card:
-        st.markdown("### 📌 已自动识别数据类型 · 点击按钮直达对应 Tab 分析")
+        st.markdown("### 📌 已自动识别数据类型 · 点按钮后看上方 👆 标签栏")
         _cols = st.columns(min(len(_recognized), 3))
         for _i, _r in enumerate(_recognized):
             with _cols[_i % len(_cols)]:
@@ -728,14 +698,24 @@ if _recognized:
                 )
                 if _btn:
                     _tab_label = _r['tab_name']
-                    st.toast(f"🎯 请点击顶部标签栏的 「{_tab_label}」 查看分析结果", icon="✅")
+                    _tab_idx = _TAB_ORDER.index(_tab_label) + 1 if _tab_label in _TAB_ORDER else "?"
+                    # ASCII 箭头指向目标 Tab 的位置示意图
+                    _arrow_bar = "  ".join([f"{'👇' if i+1==_tab_idx else '──'}" for i in range(len(_TAB_ORDER))])
+                    _idx_bar  = "  ".join([f"[{i+1}]" for i in range(len(_TAB_ORDER))])
+                    st.toast(f"🎯 第 {_tab_idx} 个 Tab「{_tab_label}」→ 看标签栏!", icon="✅")
                     st.success(
-                        f"🎯 **请直接点击页面最上方蓝色/灰色标签栏中的「{_tab_label}」**\n\n"
-                        f"↑↑↑ 就在你现在看的这段文字的上方,11 个标签排成一行的位置。"
-                        + (f"\n另外:{_r.get('extra_tabs')} 也有对应分析。" if _r.get("extra_tabs") else ""),
-                        icon="👆",
+                        f"## 👆 请点击页面**最上方标签栏第 {_tab_idx} 个**「{_tab_label}」\n\n"
+                        f"```\n"
+                        f"Tab 顺序: {_idx_bar}\n"
+                        f"箭头指: {_arrow_bar}\n"
+                        f"```\n\n"
+                        f"↑↑↑ 11 个标签就排在当前这段话的正上方,"
+                        f"找到标 🔵「{_tab_label}」的那个直接点一下就行。"
+                        + (f"\n\n💡 其他相关 Tab: {', '.join(_r['extra_tabs'])}" if _r.get("extra_tabs") else ""),
+                        icon="🎯",
                     )
                     st.balloons()
+                    st.snow()
 
 
 # ---------- 主区域 Tab ----------
