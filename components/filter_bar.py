@@ -60,7 +60,7 @@ def render_filter_bar() -> dict:
             # 取整到分钟再减1小时,转 time 对象
             value=(now.replace(minute=0, second=0) - timedelta(hours=1)).time(),
             key='start_time',
-            step=timedelta(seconds=1),  # 支持1秒步进
+            step=timedelta(minutes=1),
         )
 
     # ---------- 列3:结束时间(日期 + 时间,支持秒) ----------
@@ -74,7 +74,7 @@ def render_filter_bar() -> dict:
             '结束时间',
             value=now.replace(second=0),
             key='end_time',
-            step=timedelta(seconds=1),
+            step=timedelta(minutes=1),
         )
 
     # ---------- 列4:信号多选 ----------

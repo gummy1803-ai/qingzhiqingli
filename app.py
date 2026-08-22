@@ -374,13 +374,35 @@ data: dict[str, pd.DataFrame] = {}
 if use_builtin == "使用内置数据(自动扫描)":
     data = load_default_csvs()
 
-# 通用文件上传处理:按后缀分发到 CSV 合并 / Word 表格 / Excel 表格
+# 通用文件上传处理:按后缀分发到 CSV 合并 / Word 表格(标准耐久解析) / Excel 表格
 csv_parts: list[pd.DataFrame] = []
-docx_rows: list[dict] = []
-xls_parts: list[pd.DataFrame] = []
+docx_parts: list[pd.DataFrame] = []  # ✅ ② 耐久工步:标准宽表结构(stage_start_h/平均单体电压/净输出功率...列齐全)
+xls_parts: list[pd.DataFrame] = []   # ① 整车:带 Timestamp 的 Excel
+bench_parts: list[pd.DataFrame] = [] # ✅ ③ 台架循环:无 Timestamp 但含 循环/cycle/功率点 等关键词的 CSV/Excel
+
+def _classify_no_timestamp_df(df: pd.DataFrame, fname: str) -> tuple[str, str]:
+    """无 Timestamp 的表 → 三选一分类: '耐久工步' / '台架循环' / '未知'。
+    返回 (类别, 原因描述)。
+    """
+    cols_lower = {str(c).lower() for c in df.columns}
+    # -------- 耐久工步(docx标准宽表)命中关键字 --------
+    dur_hits = [k for k in {"平均单体电压(v)", "净输出功率(kw)", "目标功率(kw)", "电堆电流(a)",
+                           "电压方差", "离均差", "hfr", "lfr", "空压机功耗", "水泵功耗",
+                           "冷却水入口温度(℃)", "冷却水出口温度(℃)"}
+               if k in cols_lower]
+    if len(dur_hits) >= 2 or ("stage_start_h" in cols_lower or "stage" in cols_lower) or re.search(r"耐久\d+-\d+", fname):
+        return "耐久工步", f"命中耐久关键字: {dur_hits[:3]} / 文件名匹配耐久XX-YY"
+    # -------- 台架循环命中关键字 --------
+    bench_hits = [k for k in {"循环", "loop", "cycle", "循环编号", "循环次数", "功率点",
+                             "电流密度", "效率", "hydrogen利用率", "氢气利用率", "stack_voltage",
+                             "单体平均电压", "系统效率", "net_power", "net_efficiency", "spec_power_density"}
+                 if k in cols_lower]
+    if len(bench_hits) >= 2:
+        return "台架循环", f"命中台架循环关键字: {bench_hits[:4]}"
+    return "未知", "未命中耐久/台架关键词,跳过"
 
 if uploaded_files:
-
+    import tempfile
     for f in uploaded_files:
         suffix = Path(f.name).suffix.lower()
         try:
@@ -390,39 +412,86 @@ if uploaded_files:
                     df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
                     csv_parts.append(df)
                 else:
-                    st.warning(f"{f.name}: 缺 Timestamp 列,跳过")
+                    # ✅ 不再直接跳过 → 先按「台架循环/耐久工步」分类
+                    _cls, _why = _classify_no_timestamp_df(df, f.name)
+                    if _cls == "耐久工步":
+                        # 补耐久标准列(stage/stage_start_h/step_idx),然后进 docx_parts
+                        if "stage" not in df.columns:
+                            df["stage"] = Path(f.name).stem
+                        if "stage_start_h" not in df.columns:
+                            m = re.search(r"耐久(\d+)-(\d+)", Path(f.name).stem)
+                            df["stage_start_h"] = int(m.group(1)) if m else 0
+                        if "step_idx" not in df.columns:
+                            df["step_idx"] = range(len(df))
+                        if "file" not in df.columns:
+                            df["file"] = f.name
+                        docx_parts.append(df)
+                        st.info(f"{f.name}: 自动识别为 **耐久工步** → 归入「耐久衰减」Tab ({_why})")
+                    elif _cls == "台架循环":
+                        if "file" not in df.columns:
+                            df["file"] = f.name
+                        bench_parts.append(df)
+                        st.info(f"{f.name}: 自动识别为 **台架循环** → 归入「🔬 台架耐久统计及预警」Tab ({_why})")
+                    else:
+                        st.warning(f"{f.name}: 缺 Timestamp 列,且未命中耐久/台架关键字,暂无法归类 → 请检查列名或格式({_why})")
             elif suffix in (".doc", ".docx"):
-                # Word 文档按耐久 docx 流程处理
-                from docx import Document
-                # 旧 .doc 格式 python-docx 不支持,会抛异常,在 except 提示
-                doc = Document(io.BytesIO(f.read()))
-                stage = Path(f.name).stem.split("-")[0].replace("耐久", "")
-                for ti, t in enumerate(doc.tables):
-                    for ri, r in enumerate(t.rows):
-                        for ci, c in enumerate(r.cells):
-                            docx_rows.append({
-                                "file": f.name, "stage": stage,
-                                "table_idx": ti, "row_idx": ri,
-                                "col_idx": ci, "value": c.text.strip(),
-                            })
+                # ✅ Word 文档:直接复用 load_durability_docx() 标准解析(会加 stage/stage_start_h/step_idx,
+                #    并产出「平均单体电压(V)、净输出功率(kW)」等标准宽表列 — 与内置 docx 加载结果一致)
+                if suffix == ".doc":
+                    st.warning(f"{f.name}: 旧版 .doc 格式不受支持,请另存为 .docx 后再上传")
+                    continue
+                f_bytes = f.read()
+                with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+                    tmp.write(f_bytes)
+                    tmp_path = tmp.name
+                try:
+                    tmp_df = load_durability_docx([tmp_path])
+                    if not tmp_df.empty:
+                        tmp_df["file"] = f.name
+                        docx_parts.append(tmp_df)
+                finally:
+                    try:
+                        Path(tmp_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
             elif suffix in (".xls", ".xlsx"):
-                # Excel 表格:统一规范化为 DataFrame
                 xls_df = pd.read_excel(io.BytesIO(f.read()))
-                # 如果含 Timestamp 列,作为整车数据
                 if "Timestamp" in xls_df.columns:
-                    xls_df["Timestamp"] = pd.to_datetime(
-                        xls_df["Timestamp"], errors="coerce")
+                    xls_df["Timestamp"] = pd.to_datetime(xls_df["Timestamp"], errors="coerce")
                     xls_parts.append(xls_df)
                 else:
-                    # 无 Timestamp 的 Excel 表,作为耐久补充数据
-                    # 把列名 + 值铺平成 docx_rows 同结构
-                    for ri, row in xls_df.iterrows():
-                        for ci, col in enumerate(xls_df.columns):
-                            docx_rows.append({
-                                "file": f.name, "stage": Path(f.name).stem,
-                                "table_idx": 0, "row_idx": int(ri),
-                                "col_idx": ci, "value": str(row[col]),
-                            })
+                    # ✅ 无 Timestamp 的 Excel → 先分类(耐久工步 vs 台架循环)
+                    _cls, _why = _classify_no_timestamp_df(xls_df, f.name)
+                    if _cls == "耐久工步" or (re.search(r"耐久(\d+)-(\d+)", Path(f.name).stem)):
+                        # 耐久工步:缺标准列就补
+                        if "stage" not in xls_df.columns:
+                            xls_df["stage"] = Path(f.name).stem
+                        if "stage_start_h" not in xls_df.columns:
+                            m = re.search(r"耐久(\d+)-(\d+)", Path(f.name).stem)
+                            xls_df["stage_start_h"] = int(m.group(1)) if m else 0
+                        if "step_idx" not in xls_df.columns:
+                            xls_df["step_idx"] = range(len(xls_df))
+                        if "file" not in xls_df.columns:
+                            xls_df["file"] = f.name
+                        docx_parts.append(xls_df)
+                        st.info(f"{f.name}: 自动识别为 **耐久工步** → 归入「耐久衰减」Tab")
+                    elif _cls == "台架循环":
+                        if "file" not in xls_df.columns:
+                            xls_df["file"] = f.name
+                        bench_parts.append(xls_df)
+                        st.info(f"{f.name}: 自动识别为 **台架循环** → 归入「🔬 台架耐久统计及预警」Tab")
+                    else:
+                        # 兜底:不明类型 → 当耐久工步补充数据(至少能看到数据),同时打 warning
+                        if "stage" not in xls_df.columns:
+                            xls_df["stage"] = Path(f.name).stem
+                        if "stage_start_h" not in xls_df.columns:
+                            xls_df["stage_start_h"] = 0
+                        if "step_idx" not in xls_df.columns:
+                            xls_df["step_idx"] = range(len(xls_df))
+                        if "file" not in xls_df.columns:
+                            xls_df["file"] = f.name
+                        docx_parts.append(xls_df)
+                        st.warning(f"{f.name}: 未命中耐久/台架关键词 → 已作为耐久补充数据导入,请在「耐久衰减」Tab 里确认是否符合预期。({_why})")
             else:
                 st.warning(f"{f.name}: 不支持的格式 ({suffix})")
         except Exception as e:
@@ -430,6 +499,15 @@ if uploaded_files:
             if suffix == ".doc":
                 tip = " (旧版 .doc 格式不受支持,请另存为 .docx 后再上传)"
             st.warning(f"{f.name} 解析失败{tip}: {e}")
+            logger.warning("上传文件解析失败 %s: %s", f.name, e, exc_info=True)
+
+    # ✅ 台架循环行总数 → 存到 session_state,让顶部识别卡片能看到(跨模块跨 rerun 共享)
+    if bench_parts:
+        st.session_state["_bench_parts"] = bench_parts
+        st.session_state["_bench_parts_count"] = sum(int(len(b)) for b in bench_parts)
+    else:
+        st.session_state.pop("_bench_parts", None)
+        st.session_state.pop("_bench_parts_count", None)
 
     # 合并 CSV 部分(含 Excel 转 CSV 的)
     all_csv_parts = csv_parts + xls_parts
@@ -481,8 +559,18 @@ if uploaded_files:
 # 耐久数据:内置 + 上传的 Word/Excel 补充
 dur_df = (load_default_durability()
           if use_builtin == "使用内置数据(自动扫描)" else pd.DataFrame())
-if docx_rows:
-    dur_df = pd.concat([dur_df, pd.DataFrame(docx_rows)], ignore_index=True)
+if docx_parts:
+    uploaded_dur = pd.concat(docx_parts, ignore_index=True)
+    if dur_df.empty:
+        dur_df = uploaded_dur
+    else:
+        dur_df = pd.concat([dur_df, uploaded_dur], ignore_index=True)
+
+# 台架循环数据(上传的无 Timestamp 但命中台架关键词的 CSV/Excel)
+try:
+    _bench_count = int(st.session_state.get("_bench_parts_count", 0))
+except Exception:
+    _bench_count = 0
 
 
 # ---------- 顶部状态 ----------
@@ -490,38 +578,165 @@ if docx_rows:
 st.title("📊 设备测试数据分析与自动报告助手")
 st.caption("上传或使用内置数据,自动完成合并 / 清洗 / 指标计算 / 可视化 / 一键导出报告")
 
-# 🔧 Bug 修复:之前只要 data(整车 CSV) 为空就 st.stop(),
-# 导致只上传 .docx / 无Timestamp的 .xlsx(只进 dur_df 耐久数据)时页面直接停住,
-# 用户观感是"上传后没反应"。现在只要 dur_df 或 data 任一有就放行。
-if (not data) and (dur_df is None or len(dur_df) == 0):
+# 🔧 Bug 修复 + 三类型放行: 整车 data / 耐久 dur_df / 台架循环 bench_count, 任一有就不 stop
+_has_any = bool(data) or bool(dur_df is not None and len(dur_df) > 0) or _bench_count > 0
+if not _has_any:
     st.warning(
         "⚠️ 未检测到任何数据。\n\n"
-        "👉 上传格式提示:\n"
-        "- **整车分析**:CSV / Excel (必须含 `Timestamp` 列)\n"
-        "- **耐久分析**:Word(.docx) / Excel (不一定需 Timestamp,会进耐久 Tab)\n"
+        "👉 上传格式提示(自动识别分类归入对应Tab):\n"
+        "- **① 整车分析**(02_整车数据处理):CSV / Excel,必须含 `Timestamp` 列 → 整车看板/燃电/性能等 8 个 Tab\n"
+        "- **② 耐久工步**(01_耐久原始数据处理):Word(.docx) / 耐久XX-YY.xlsx → 「耐久衰减」Tab\n"
+        "- **③ 台架循环**(03_台架耐久数据):含「循环/功率点/效率」等关键词的 CSV / Excel → 「台架耐久统计及预警」Tab\n"
         "- 旧版 `.doc` 请另存为 `.docx` 后再上传"
     )
     st.stop()
-elif not data:
-    # 只有耐久数据、没有整车数据:提示但放行,允许进「耐久衰减」Tab
+elif not data and (dur_df is None or len(dur_df) == 0) and _bench_count > 0:
     st.info(
-        f"💡 已检测到 **耐久数据 {len(dur_df)} 条** (无整车 CSV 数据)。\n\n"
-        "可直接切换到「耐久衰减」Tab 查看 docx 分析;\n"
-        "整车看板 / 燃电看板等需要 CSV Timestamp 列的 Tab 会显示空数据提示。"
+        f"🏭 已检测到 **台架循环数据 {_bench_count:,} 行** (无整车 CSV / 耐久 docx 数据)。\n\n"
+        "可直接切换到「🔬 台架耐久统计及预警」Tab 分析;\n整车看板/耐久衰减等其他 Tab 会显示空数据提示。"
     )
-else:
-    # 有整车数据:在 info 里补充下解析到了啥耐久,让用户知道"上传真的生效了"
-    if len(dur_df):
+elif not data:
+    # 有耐久 + 可能还有台架
+    if _bench_count > 0:
         st.info(
-            f"📦 上传解析结果:整车 CSV {len(data)} 辆车 · 耐久数据 {len(dur_df)} 条工步"
-            " (耐久数据在「耐久衰减」Tab 里查看)"
+            f"💡 已检测到 **耐久数据 {len(dur_df):,} 条工步** + 🏭 **台架循环 {_bench_count:,} 行** (无整车 CSV)。\n\n"
+            "耐久 → 「耐久衰减」Tab;台架 → 「🔬 台架耐久统计及预警」Tab。"
+        )
+    else:
+        st.info(
+            f"💡 已检测到 **耐久数据 {len(dur_df):,} 条** (无整车 CSV 数据)。\n\n"
+            "可直接切换到「耐久衰减」Tab 查看 docx 分析;\n整车看板 / 燃电看板等需要 CSV Timestamp 列的 Tab 会显示空数据提示。"
+        )
+else:
+    # 有整车
+    extra_msgs = []
+    if len(dur_df):
+        extra_msgs.append(f"耐久 {len(dur_df):,} 条工步")
+    if _bench_count > 0:
+        extra_msgs.append(f"台架 {_bench_count:,} 行")
+    if extra_msgs:
+        st.info(
+            f"📦 上传解析结果:整车 CSV {len(data)} 辆车 · {' · '.join(extra_msgs)}"
+            " (耐久→「耐久衰减」Tab;台架→「台架耐久统计及预警」Tab)"
         )
 
 cars = list(data.keys())
+_msgs: list[str] = []
 if cars:
-    st.success(f"已加载 {len(cars)} 辆车数据: {', '.join(cars)}  |  耐久 docx: {len(dur_df)} 条")
-else:
-    st.success(f"已加载 耐久数据: {len(dur_df)} 条工步 (无整车 CSV,请切换到「耐久衰减」Tab)")
+    _msgs.append(f"已加载 {len(cars)} 辆车: {', '.join(cars)}")
+if len(dur_df):
+    _msgs.append(f"耐久 docx: {len(dur_df):,} 条工步")
+if _bench_count > 0:
+    _msgs.append(f"台架循环: {_bench_count:,} 行")
+st.success(" | ".join(_msgs) if _msgs else "暂无已加载数据")
+
+# ============================================================
+# 📌 三数据类型自动识别 + 一键直达对应 Tab
+# 与企业资料包02_氢质氢离 下三个子目录严格一一对应:
+#   ① 02_整车数据处理  → 带 Timestamp 的 CSV / Excel → 整车看板/燃电/性能/绝缘 等 8 个 Tab
+#   ② 01_耐久原始数据处理 → 耐久XX-YY.docx → 耐久衰减 Tab
+#   ③ 03_台架耐久数据   → 循环/功率点 CSV → 台架耐久统计及预警 Tab
+# ============================================================
+def _detect_data_type_tags(df: pd.DataFrame) -> set[str]:
+    """无 Timestamp 的表 → 判断归属耐久工步 / 台架循环。"""
+    if df is None or df.empty:
+        return set()
+    cols_lower = {str(c).lower() for c in df.columns}
+    tags = set()
+    # 耐久工步(docx标准宽表):含 平均单体电压 / 净输出功率 / 目标功率 / 电堆电流 等工步列
+    if any(k in cols_lower for k in {"平均单体电压(v)", "净输出功率(kw)", "目标功率(kw)", "电堆电流(a)", "stage_start_h", "stage", "电压方差", "离均差", "hfr"}):
+        tags.add("耐久工步")
+    # 台架循环:含 循环/loop/cycle/功率点/电流密度/效率 等台架特征列
+    if any(k in cols_lower for k in {"循环", "loop", "cycle", "循环编号", "循环次数", "功率点", "电流密度", "效率", "hydrogen利用率", "氢气利用率"}):
+        tags.add("台架循环")
+    return tags
+
+_recognized: list[dict] = []
+
+# ---------- ① 整车数据 ----------
+if bool(data):
+    _total_rows = sum(int(len(v)) for v in data.values())
+    _recognized.append({
+        "kind": "整车数据",
+        "dir": "02_整车数据处理",
+        "tab_name": "整车看板",
+        "summary": f"{len(cars)} 辆车 · 合计 {_total_rows:,} 行",
+        "emoji": "🚗",
+        "extra_tabs": ["⚡ 燃电运行看板", "📈 性能统计预测", "趋势预测", "🔌 绝缘阻值统计", "报告导出", "AI 助手", "多车对比"],
+    })
+
+# ---------- ② 耐久工步数据(docx) ----------
+_dur_工步_tags = _detect_data_type_tags(dur_df)
+if dur_df is not None and len(dur_df) > 0 and ("耐久工步" in _dur_工步_tags or "stage_start_h" in (dur_df.columns if dur_df is not None else []) or "平均单体电压(V)" in (dur_df.columns if dur_df is not None else [])):
+    _n_stages = int(dur_df["stage"].nunique()) if "stage" in dur_df.columns else 0
+    _recognized.append({
+        "kind": "耐久工步数据",
+        "dir": "01_耐久原始数据处理",
+        "tab_name": "耐久衰减",
+        "summary": f"{len(dur_df):,} 条工步 · {_n_stages} 个阶段",
+        "emoji": "📉",
+    })
+
+# ---------- ③ 台架循环数据(上传的无 Timestamp CSV/Excel 若命中台架关键词) ----------
+try:
+    _bench_parts_total_rows = 0
+    if "_bench_parts_count" in st.session_state:
+        _bench_parts_total_rows = int(st.session_state["_bench_parts_count"])
+except Exception:
+    _bench_parts_total_rows = 0
+if _bench_parts_total_rows > 0:
+    _recognized.append({
+        "kind": "台架循环数据",
+        "dir": "03_台架耐久数据",
+        "tab_name": "🔬 台架耐久统计及预警",
+        "summary": f"{_bench_parts_total_rows:,} 行循环数据",
+        "emoji": "🏭",
+    })
+# 内置台架目录的CSV也算
+import os as _os
+_bench_builtin_dir = Path(__file__).resolve().parent / "企业资料包02_氢质氢离" / "03_台架耐久数据"
+if _bench_builtin_dir.exists() and use_builtin == "使用内置数据(自动扫描)":
+    _bench_csvs = list(_bench_builtin_dir.glob("*.csv"))
+    if _bench_csvs:
+        _recognized.append({
+            "kind": "台架循环数据",
+            "dir": "03_台架耐久数据",
+            "tab_name": "🔬 台架耐久统计及预警",
+            "summary": f"内置 {len(_bench_csvs)} 份 CSV (进入 Tab 加载)",
+            "emoji": "🏭",
+        })
+
+if _recognized:
+    _jump_card = st.container(border=True)
+    with _jump_card:
+        st.markdown("### 📌 已自动识别数据类型 · 点击按钮直达对应 Tab 分析")
+        _cols = st.columns(min(len(_recognized), 3))
+        for _i, _r in enumerate(_recognized):
+            with _cols[_i % len(_cols)]:
+                st.markdown(
+                    f"#### {_r['emoji']} {_r['kind']}\n"
+                    f"- 📁 目录: `{_r['dir']}`\n"
+                    f"- 📊 {_r['summary']}\n"
+                    f"- 🎯 主 Tab: **{_r['tab_name']}**"
+                    + (f"\n- 💡 其他可用 Tab: {'、'.join(_r['extra_tabs'])}" if _r.get("extra_tabs") else "")
+                )
+                _btn = st.button(
+                    f"👉 去「{_r['tab_name']}」分析",
+                    type="primary",
+                    key=f"jump_btn_{_r['tab_name']}_{_i}",
+                    use_container_width=True,
+                )
+                if _btn:
+                    _tab_label = _r['tab_name']
+                    st.toast(f"🎯 请点击顶部标签栏的 「{_tab_label}」 查看分析结果", icon="✅")
+                    st.success(
+                        f"🎯 **请直接点击页面最上方蓝色/灰色标签栏中的「{_tab_label}」**\n\n"
+                        f"↑↑↑ 就在你现在看的这段文字的上方,11 个标签排成一行的位置。"
+                        + (f"\n另外:{_r.get('extra_tabs')} 也有对应分析。" if _r.get("extra_tabs") else ""),
+                        icon="👆",
+                    )
+                    st.balloons()
+
 
 # ---------- 主区域 Tab ----------
 
@@ -541,7 +756,16 @@ def _render_tab_overview(
     time_range_preset: str,
 ) -> None:
     """Tab1: 整车看板。"""
+    if not cars:
+        st.info("未检测到整车 CSV 数据。请在侧边栏选择「上传文件」并拖入带 `Timestamp` 列的 CSV / Excel,或使用内置数据模式。")
+        return
+    if not data:
+        st.warning("暂无已加载的整车数据,请检查数据源或切换数据模式。")
+        return
     sel_car = st.selectbox("选择车辆", cars, key="overview_car")
+    if sel_car is None or sel_car not in data:
+        st.warning("请先上传/选择有效车辆数据。")
+        return
     df = data[sel_car]
 
     # 时间区间过滤(支持预设 + 自定义)
@@ -616,8 +840,21 @@ def _render_tab_overview(
 @tab_safe_render
 def _render_tab_durability(dur_df: pd.DataFrame) -> None:
     """Tab2: 耐久衰减(docx 聚合分析 + 曲线)。"""
-    if dur_df.empty:
-        st.info("未检测到耐久 docx 数据。可去侧边栏切到『上传 docx 耐久』后拖入文件。")
+    if dur_df is None or dur_df.empty:
+        st.info("未检测到耐久 docx 数据。可去侧边栏切到『上传文件』后拖入 docx / 无 Timestamp 的 Excel。")
+        return
+
+    # ✅ 防御:列结构完整性检查(上传的 Excel 可能缺标准列)
+    req_cols = ["stage_start_h", "stage", "平均单体电压(V)", "净输出功率(kW)", "电堆电流(A)"]
+    missing = [c for c in req_cols if c not in dur_df.columns]
+    if missing:
+        st.warning(
+            f"上传的耐久数据缺少以下必需列: `{missing}`\n\n"
+            f"当前数据有 {len(dur_df)} 行,实际列: {list(dur_df.columns)}\n"
+            f"建议:拖入「耐久XX-YY.docx」,标准解析会自动产出 stage_start_h / 各指标列。"
+        )
+        st.subheader(f"当前上传耐久原始数据预览 ({len(dur_df)} 行,{len(dur_df.columns)} 列)")
+        st.dataframe(dur_df.head(100), use_container_width=True)
         return
 
     st.subheader("耐久 docx 元数据")
@@ -632,70 +869,124 @@ def _render_tab_durability(dur_df: pd.DataFrame) -> None:
     st.subheader(f"耐久数据(共 {len(dur_df)} 条工步,跨 {dur_df['stage'].nunique()} 个阶段)")
     st.dataframe(dur_df, use_container_width=True, hide_index=True)
 
-    # 按阶段聚合
+    # 按阶段聚合(用 stage_start_h 排序保证真实耐久先后顺序)
     st.subheader("各阶段指标聚合")
-    agg = dur_df.groupby(["stage_start_h", "stage"]).agg(
-        平均单体电压=("平均单体电压(V)", "mean"),
-        净输出功率=("净输出功率(kW)", "mean"),
-        电堆电流=("电堆电流(A)", "mean"),
-        离均差=("离均差", "mean"),
-        电压方差=("电压方差", "mean"),
-    ).reset_index()
+    # 防御:有 stage 但全是 NaN 时,groupby 会掉所有行 → 先 sort_values 再按 stage_start_h 分组
+    dur_sorted = dur_df.sort_values(["stage_start_h", "step_idx"], kind="stable").reset_index(drop=True)
+    agg_cols_map = {
+        "平均单体电压": "平均单体电压(V)",
+        "净输出功率": "净输出功率(kW)",
+        "电堆电流": "电堆电流(A)",
+    }
+    # 仅对存在的数值列 agg(可能列不齐),避免 KeyError
+    agg_dict = {new: (old, "mean") for new, old in agg_cols_map.items() if old in dur_sorted.columns}
+    opt_cols = {"离均差", "电压方差"}
+    for c in opt_cols:
+        if c in dur_sorted.columns:
+            agg_dict[c] = (c, "mean")
+    if not agg_dict:
+        st.warning(f"数据中找不到任何可聚合数值列,实际列: {list(dur_sorted.columns)}")
+        st.dataframe(dur_sorted.head(100), use_container_width=True)
+        return
+    agg = dur_sorted.groupby(["stage_start_h", "stage"]).agg(**agg_dict).reset_index()
+    agg = agg.sort_values("stage_start_h", kind="stable").reset_index(drop=True)
+
+    if agg.empty:
+        st.warning("按阶段聚合后无数据(可能 stage 或 stage_start_h 全为空),请检查上传文件格式。")
+        st.dataframe(dur_sorted.head(100), use_container_width=True)
+        return
+
+    st.dataframe(dur_sorted.head(100), use_container_width=True, hide_index=True)
+    st.caption(f"数据预览(前 100 行) · 全量 {len(dur_sorted)} 行 × {dur_sorted['stage'].nunique()} 个阶段")
 
     # KPI 卡片:整体衰减
-    k1, k2, k3 = st.columns(3)
-    first_v = float(agg.iloc[0]["平均单体电压"])
-    last_v = float(agg.iloc[-1]["平均单体电压"])
-    with k1:
-        st.metric("首阶段平均电压(V)", round(first_v, 2))
-    with k2:
-        st.metric("末阶段平均电压(V)", round(last_v, 2))
-    with k3:
-        delta = round(last_v - first_v, 2)
-        st.metric("衰减量(V)", delta, delta=delta, delta_color="inverse")
+    if "平均单体电压" in agg.columns and len(agg) >= 1:
+        k1, k2, k3 = st.columns(3)
+        first_v = float(agg.iloc[0]["平均单体电压"])
+        last_v = float(agg.iloc[-1]["平均单体电压"])
+        with k1:
+            st.metric("首阶段平均电压(V)", round(first_v, 3))
+        with k2:
+            st.metric("末阶段平均电压(V)", round(last_v, 3))
+        with k3:
+            delta = round(last_v - first_v, 3)
+            st.metric("衰减量(mV)", int(delta * 1000), delta=int(delta * 1000), delta_color="inverse")
 
+    st.subheader(f"阶段聚合表 ({len(agg)} 阶段)")
     st.dataframe(agg, use_container_width=True, hide_index=True)
 
     # 衰减趋势图(用 stage_start_h 作为 X,显示真实耐久小时数)
-    from src.plots import _base_layout
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
+    has_v = "平均单体电压" in agg.columns
+    has_p = "净输出功率" in agg.columns
+    if has_v or has_p:
+        from src.plots import _base_layout
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
 
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Scatter(
-        x=agg["stage"], y=agg["平均单体电压"],
-        mode="lines+markers", name="平均单体电压(V)",
-        line=dict(color="#1f77b4", width=2),
-    ), secondary_y=False)
-    fig.add_trace(go.Scatter(
-        x=agg["stage"], y=agg["净输出功率"],
-        mode="lines+markers", name="净输出功率(kW)",
-        line=dict(color="#ff7f0e", width=2, dash="dot"),
-    ), secondary_y=True)
-    fig.update_layout(**_base_layout("耐久衰减趋势:平均单体电压 + 净输出功率"))
-    fig.update_yaxes(title_text="平均单体电压 (V)", secondary_y=False)
-    fig.update_yaxes(title_text="净输出功率 (kW)", secondary_y=True)
-    fig.update_xaxes(title_text="耐久阶段 (h)")
-    st.plotly_chart(fig, use_container_width=True)
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        if has_v:
+            fig.add_trace(go.Scatter(
+                x=agg["stage_start_h"], y=agg["平均单体电压"],
+                mode="lines+markers", name="平均单体电压(V)",
+                line=dict(color="#1f77b4", width=2),
+                hovertemplate="%{x:.0f}h<br>%{y:.4f} V<extra></extra>",
+            ), secondary_y=False)
+        if has_p:
+            fig.add_trace(go.Scatter(
+                x=agg["stage_start_h"], y=agg["净输出功率"],
+                mode="lines+markers", name="净输出功率(kW)",
+                line=dict(color="#ff7f0e", width=2, dash="dot"),
+                hovertemplate="%{x:.0f}h<br>%{y:.2f} kW<extra></extra>",
+            ), secondary_y=True)
+        fig.update_layout(**_base_layout("耐久衰减趋势:平均单体电压 + 净输出功率"))
+        fig.update_yaxes(title_text="平均单体电压 (V)", secondary_y=False)
+        fig.update_yaxes(title_text="净输出功率 (kW)", secondary_y=True)
+        fig.update_xaxes(title_text="耐久起始小时数 stage_start_h (h)")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("当前数据缺「平均单体电压」或「净输出功率」列,跳过衰减趋势图。")
 
     # 同阶段内工步曲线(选取代表性阶段)
-    st.subheader("阶段内功率-电压特性曲线")
+    st.subheader("阶段内功率-电压特性曲线(极化曲线)")
+
+    def _stage_sort_key(s: str):
+        """阶段名兼容: '40-45' 取 40;纯文件名 fallback 到 0。"""
+        if isinstance(s, str) and "-" in s:
+            try:
+                return int(s.split("-")[0])
+            except Exception:
+                pass
+        try:
+            return int(float(str(s)))
+        except Exception:
+            return 0
+
+    unique_stages = list(dur_sorted["stage"].dropna().unique())
+    if not unique_stages:
+        st.warning("无可用阶段数据,跳过极化曲线。")
+        return
     sel_stage = st.selectbox(
         "选择阶段",
-        sorted(dur_df["stage"].unique(), key=lambda s: int(s.split("-")[0])),
+        sorted(unique_stages, key=_stage_sort_key),
         key="dur_stage",
     )
-    sub = dur_df[dur_df["stage"] == sel_stage].sort_values("step_idx")
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(
-        x=sub["电堆电流(A)"], y=sub["平均单体电压(V)"],
-        mode="lines+markers", name=f"阶段 {sel_stage}",
-        line=dict(color="#2ca02c", width=2),
-    ))
-    fig2.update_layout(**_base_layout(f"阶段 {sel_stage} 极化曲线"))
-    fig2.update_xaxes(title_text="电堆电流 (A)")
-    fig2.update_yaxes(title_text="平均单体电压 (V)")
-    st.plotly_chart(fig2, use_container_width=True)
+    sub = dur_sorted[dur_sorted["stage"] == sel_stage]
+    if "step_idx" in sub.columns:
+        sub = sub.sort_values("step_idx")
+    if "电堆电流(A)" in sub.columns and "平均单体电压(V)" in sub.columns:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(
+            x=sub["电堆电流(A)"], y=sub["平均单体电压(V)"],
+            mode="lines+markers", name=f"阶段 {sel_stage}",
+            line=dict(color="#2ca02c", width=2),
+        ))
+        fig2.update_layout(**_base_layout(f"阶段 {sel_stage} 极化曲线"))
+        fig2.update_xaxes(title_text="电堆电流 (A)")
+        fig2.update_yaxes(title_text="平均单体电压 (V)")
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.info(f"当前阶段缺「电堆电流(A)」或「平均单体电压(V)」列,无法画极化曲线。阶段内数据预览:")
+        st.dataframe(sub, use_container_width=True)
 
 
 @tab_safe_render
@@ -707,8 +998,23 @@ def _render_tab_bench() -> None:
     bench_dir = DATA_ROOT / "03_台架耐久数据"
     csv_files = sorted(bench_dir.glob("*.csv")) if bench_dir.exists() else []
 
-    if not csv_files:
-        st.info(f"未检测到台架耐久 CSV 数据。请将文件放到:\n`{bench_dir}`")
+    # ✅ 读取上传时存入 session_state 的台架循环数据(无 Timestamp 但命中台架关键词)
+    uploaded_bench_frames: list[pd.DataFrame] = []
+    try:
+        _sbp = st.session_state.get("_bench_parts", [])
+        if isinstance(_sbp, list):
+            for _df in _sbp:
+                if isinstance(_df, pd.DataFrame) and not _df.empty:
+                    uploaded_bench_frames.append(_df.copy())
+    except Exception as e:
+        logger.warning("读取 session_state 台架数据失败: %s", e, exc_info=True)
+
+    if not csv_files and not uploaded_bench_frames:
+        st.info(
+            f"未检测到台架耐久数据。\n\n"
+            f"方式 1: 将 CSV 放到内置目录 `{bench_dir}`\n"
+            f"方式 2: 在侧边栏「上传文件」处拖入含「循环/功率点/效率」等关键词的 CSV/Excel"
+        )
         return
 
     from durability.data_parser import parse_durability_data
@@ -722,26 +1028,60 @@ def _render_tab_bench() -> None:
         'FC_AvgCellVoltDev',
     ]
 
+    # ---------- ① 内置目录 CSV(走缓存,按文件 mtime 失效) ----------
     @st.cache_data(ttl=60, show_spinner="解析台架耐久 CSV...")
-    def _load_bench_agg(files: tuple[str, ...], _mtimes: tuple[float, ...]) -> pd.DataFrame:
+    def _load_bench_builtin(files: tuple[str, ...], _mtimes: tuple[float, ...]) -> pd.DataFrame:
         frames = []
         for f in files:
             try:
                 df = pd.read_csv(f)
                 parsed = parse_durability_data(df)
                 frames.append(parsed)
-                logger.info("解析台架 CSV: %s | %d 行", f, len(parsed))
+                logger.info("解析内置台架 CSV: %s | %d 行", f, len(parsed))
             except Exception as e:
                 logger.error("解析失败 %s: %s", f, e)
         if not frames:
             return pd.DataFrame()
-        merged = pd.concat(frames, ignore_index=True)
-        return aggregate_durability_stats(merged, _SIGNAL_COLS)
+        return pd.concat(frames, ignore_index=True)
 
+    builtin_parsed = pd.DataFrame()
     import os
-    _mtimes = tuple(os.path.getmtime(str(f)) for f in csv_files)
-    agg_df = _load_bench_agg(tuple(str(f) for f in csv_files), _mtimes)
-    st.success(f"已聚合 {len(agg_df)} 组 (cycle × power_point)")
+    if csv_files:
+        _mtimes = tuple(os.path.getmtime(str(f)) for f in csv_files)
+        builtin_parsed = _load_bench_builtin(tuple(str(f) for f in csv_files), _mtimes)
+
+    # ---------- ② 上传的台架数据(不走 cache,每次都解析,避免 session_state 变了缓存不更新) ----------
+    uploaded_parsed_list: list[pd.DataFrame] = []
+    if uploaded_bench_frames:
+        for _i, _udf in enumerate(uploaded_bench_frames):
+            try:
+                _p = parse_durability_data(_udf)
+                uploaded_parsed_list.append(_p)
+                logger.info("解析上传台架数据[%d] | %d 行", _i, len(_p))
+            except Exception as e:
+                logger.warning("上传台架数据[%d]解析失败: %s", _i, e, exc_info=True)
+                st.warning(f"上传台架文件 #{_i+1} 解析失败: {e}")
+
+    # ---------- ③ 合并 + 聚合 ----------
+    all_frames: list[pd.DataFrame] = []
+    if not builtin_parsed.empty:
+        all_frames.append(builtin_parsed)
+    if uploaded_parsed_list:
+        all_frames.extend(uploaded_parsed_list)
+
+    if not all_frames:
+        st.warning("所有台架数据源解析后均为空,请检查文件内容格式。")
+        return
+
+    merged_all = pd.concat(all_frames, ignore_index=True)
+    agg_df = aggregate_durability_stats(merged_all, _SIGNAL_COLS)
+    _parts_msg = []
+    if not builtin_parsed.empty:
+        _parts_msg.append(f"内置 {len(builtin_parsed):,} 行")
+    if uploaded_parsed_list:
+        _u_rows = sum(int(len(x)) for x in uploaded_parsed_list)
+        _parts_msg.append(f"上传 {_u_rows:,} 行")
+    st.success(f"已聚合 {len(agg_df)} 组 (cycle × power_point) · {' + '.join(_parts_msg)}")
 
     filter_opts = render_durability_filter()
 

@@ -102,7 +102,7 @@ def render_performance_filter() -> dict:
             '起始时间',
             value=(now.replace(minute=0, second=0) - timedelta(hours=1)).time(),
             key='perf_start_time',
-            step=timedelta(seconds=1),
+            step=timedelta(minutes=1),
         )
 
     # ---------- 列3:结束时间(日期 + 时间,支持秒) ----------
@@ -116,7 +116,7 @@ def render_performance_filter() -> dict:
             '结束时间',
             value=now.replace(second=0),
             key='perf_end_time',
-            step=timedelta(seconds=1),
+            step=timedelta(minutes=1),
         )
 
     # ---------- 列4:电流目标点(核心) + 最短持续时长 ----------

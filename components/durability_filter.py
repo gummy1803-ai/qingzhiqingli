@@ -199,13 +199,13 @@ def render_durability_filter() -> dict:
                 start_date = st.date_input('起始日期', key='dur_start_date')
                 start_time = st.time_input(
                     '起始时间', key='dur_start_time',
-                    step=timedelta(seconds=1),
+                    step=timedelta(minutes=1),
                 )
             with _tc2:
                 end_date = st.date_input('结束日期', key='dur_end_date')
                 end_time = st.time_input(
                     '结束时间', key='dur_end_time',
-                    step=timedelta(seconds=1),
+                    step=timedelta(minutes=1),
                 )
         with a2:
             agg_method = st.selectbox(
