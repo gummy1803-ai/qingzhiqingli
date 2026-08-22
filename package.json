@@ -1,0 +1,16 @@
+{
+  "name": "fc-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "燃料电池数据可视化看板(类型定义 + mock 数据)",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dayjs": "^1.11.13"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

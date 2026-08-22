@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+python-docx
+plotly
+openpyxl
+requests
+pymysql
+sqlalchemy
+python-dotenv

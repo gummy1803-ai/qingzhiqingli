@@ -1,0 +1,55 @@
+# ===== 敏感凭证(必须排除,含 API key/SMTP 授权码) =====
+# 实际配置文件(模板 .example.ini 可以提交)
+config/email_config.ini
+config/llm_config.ini
+
+# ===== 环境变量文件 =====
+.env
+.env.*
+
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+
+# ===== 运行产物 =====
+logs/
+*.log
+
+# 报告与导出(含车辆原始数据,业务敏感)
+reports/
+exports/
+
+# ===== 本地数据库 / 运行期数据(含飞书 app_secret / 联系人备份) =====
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# ===== 企业原始资料包(整车 CSV / docx / PDF 体积大且敏感, 不允许入库) =====
+企业资料包*/
+
+# ===== IDE/编辑器 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ===== 临时文件 =====
+*.tmp
+*.bak
+
+# ===== 前端工程 =====
+node_modules/
+dist/
+*.tsbuildinfo
+.npm-cache/

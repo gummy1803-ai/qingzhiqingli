@@ -1,0 +1,338 @@
+"""趋势预测模块:基于历史数据预测 4 个关键指标走势。
+
+预测目标:
+1. 单片电压压差(劣化趋势)
+2. 累计氢耗(续能估计)
+3. 故障码频率(故障率趋势)
+4. 净功率衰减(电堆衰减)
+
+实现方式: 用 numpy + sklearn 轻量实现,不依赖 statsmodels:
+- 线性回归(长期趋势)
+- 移动平均(短期平滑)
+- 滑动窗口计数(故障频率)
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
+
+from src.log_config import get_logger
+from src.metrics import _safe_num
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class ForecastResult:
+    """单个指标的预测结果。"""
+    metric_name: str  # 指标名
+    history_x: np.ndarray  # 历史时间(数值化,小时)
+    history_y: np.ndarray  # 历史值
+    future_x: np.ndarray  # 预测时间(数值化,小时)
+    future_y: np.ndarray  # 预测值
+    confidence_low: np.ndarray  # 95% 置信下界
+    confidence_high: np.ndarray  # 95% 置信上界
+    slope: float  # 趋势斜率(单位/小时)
+    r2: float  # 拟合优度
+    interpretation: str  # 趋势解读文字
+    extra: dict = field(default_factory=dict)  # 额外信息
+
+
+def _to_hours(ts: pd.Series) -> np.ndarray:
+    """把 Timestamp 序列转为以小时为单位的数值(从首时刻起算)。"""
+    ts = pd.to_datetime(ts, errors="coerce").dropna()
+    if len(ts) == 0:
+        return np.array([])
+    deltas = (ts - ts.iloc[0]).dt.total_seconds() / 3600
+    return deltas.to_numpy()
+
+
+def _linear_fit(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
+    """简单线性回归 y = a*x + b,返回 (a, b, r2)。"""
+    if len(x) < 2:
+        return 0.0, float(y.mean()) if len(y) else 0.0, 0.0
+    a, b = np.polyfit(x, y, 1)
+    y_pred = a * x + b
+    ss_res = np.sum((y - y_pred) ** 2)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    return float(a), float(b), float(r2)
+
+
+def _interpret_trend(slope_per_hour: float, slope_per_day: float,
+                     metric_name: str, ascending_bad: bool = True) -> str:
+    """生成趋势解读文字。
+
+    Args:
+        slope_per_hour: 每小时变化量
+        slope_per_day: 每天变化量(便于理解)
+        metric_name: 指标名
+        ascending_bad: True=指标变大算劣化(如压差),False=指标变小算劣化(如功率)
+    """
+    if abs(slope_per_day) < 1e-6:
+        return f"{metric_name}基本稳定,无明显趋势"
+
+    direction = "上升" if slope_per_day > 0 else "下降"
+    bad = (slope_per_day > 0) if ascending_bad else (slope_per_day < 0)
+    severity = "劣化" if bad else "改善"
+
+    return (f"{metric_name}呈{direction}趋势(每天变化 {slope_per_day:+.4f}),"
+            f"属{severity}趋势。线性拟合 R²较高时可信,需结合采样窗口判断")
+
+
+def forecast_cell_diff(df: pd.DataFrame, future_hours: float) -> ForecastResult | None:
+    """预测单片电压压差走势。"""
+    logger.info("预测压差, 输入 %d 行, 预测 %s 小时", len(df), future_hours)
+    if "FC_MaxCellVoltage" not in df.columns or "FC_MinCellVoltage" not in df.columns:
+        logger.warning("缺单电压列,无法预测压差")
+        return None
+    if "Timestamp" not in df.columns:
+        return None
+
+    mx = _safe_num(df["FC_MaxCellVoltage"])
+    mn = _safe_num(df["FC_MinCellVoltage"])
+    ok = (mx > 0) & (mx < 2000) & (mn > 0) & (mn < 2000)
+    diff = (mx - mn)[ok]
+    diff = diff[(diff > 0) & (diff < 50)].dropna()
+    ts = df["Timestamp"][ok][diff.index]
+
+    if len(diff) < 10:
+        logger.warning("过滤后压差样本不足(%d),无法预测", len(diff))
+        return None
+
+    # 按小时分箱,取每小时压差均值,降低噪声
+    hours = _to_hours(ts)
+    if len(hours) == 0:
+        return None
+    df_bin = pd.DataFrame({"h": hours, "v": diff.to_numpy()})
+    df_bin = df_bin.groupby(pd.cut(df_bin["h"], bins=np.arange(
+        0, df_bin["h"].max() + 1, 1.0))).mean().dropna()
+    x = df_bin["h"].to_numpy()
+    y = df_bin["v"].to_numpy()
+
+    if len(x) < 3:
+        return None
+
+    a, b, r2 = _linear_fit(x, y)
+    future_x = np.linspace(x.max(), x.max() + future_hours, 50)
+    future_y = a * future_x + b
+    # 置信区间: 简单用历史残差标准差作为带宽
+    resid_std = float(np.std(y - (a * x + b))) if len(y) > 2 else 1.0
+    conf_low = future_y - 1.96 * resid_std
+    conf_high = future_y + 1.96 * resid_std
+
+    return ForecastResult(
+        metric_name="单片电压压差(mV)",
+        history_x=x, history_y=y,
+        future_x=future_x, future_y=future_y,
+        confidence_low=conf_low, confidence_high=conf_high,
+        slope=a, r2=r2,
+        interpretation=_interpret_trend(
+            a, a * 24, "压差", ascending_bad=True),
+        extra={"resid_std": resid_std, "bins": len(x)},
+    )
+
+
+def forecast_hydrogen_cumulative(df: pd.DataFrame,
+                                  future_hours: float) -> ForecastResult | None:
+    """预测累计氢耗走势(基于瞬时氢耗积分)。"""
+    logger.info("预测累计氢耗, 输入 %d 行, 预测 %s 小时", len(df), future_hours)
+    if "FC_HydCmInstts" not in df.columns or "Timestamp" not in df.columns:
+        return None
+
+    hi = _safe_num(df["FC_HydCmInstts"])
+    hi = hi[hi >= 0].dropna()
+    ts = df["Timestamp"].loc[hi.index]
+
+    if len(hi) < 10:
+        return None
+
+    hours = _to_hours(ts)
+    if len(hours) == 0:
+        return None
+
+    # 累计氢耗 = 瞬时氢耗 * 时间间隔(小时)的累加
+    # 采样间隔(小时)
+    if len(hours) > 1:
+        dt = np.diff(hours, prepend=0)
+    else:
+        dt = np.array([1.0])
+    cum_h2 = np.cumsum(hi.to_numpy() * dt)
+
+    df_bin = pd.DataFrame({"h": hours, "v": cum_h2})
+    df_bin = df_bin.groupby(pd.cut(df_bin["h"], bins=np.arange(
+        0, df_bin["h"].max() + 1, 1.0))).max().dropna()
+    x = df_bin["h"].to_numpy()
+    y = df_bin["v"].to_numpy()
+
+    if len(x) < 3:
+        return None
+
+    a, b, r2 = _linear_fit(x, y)
+    future_x = np.linspace(x.max(), x.max() + future_hours, 50)
+    future_y = a * future_x + b
+    resid_std = float(np.std(y - (a * x + b))) if len(y) > 2 else 1.0
+
+    return ForecastResult(
+        metric_name="累计氢耗(kg)",
+        history_x=x, history_y=y,
+        future_x=future_x, future_y=future_y,
+        confidence_low=future_y - 1.96 * resid_std,
+        confidence_high=future_y + 1.96 * resid_std,
+        slope=a, r2=r2,
+        interpretation=_interpret_trend(
+            a, a * 24, "累计氢耗", ascending_bad=False),
+        extra={"resid_std": resid_std, "bins": len(x)},
+    )
+
+
+def forecast_fault_frequency(df: pd.DataFrame,
+                              future_hours: float) -> ForecastResult | None:
+    """预测故障码出现频率(每小时故障数)。"""
+    logger.info("预测故障频率, 输入 %d 行, 预测 %s 小时", len(df), future_hours)
+    if "FC_ErrorCode" not in df.columns or "Timestamp" not in df.columns:
+        return None
+
+    ec = _safe_num(df["FC_ErrorCode"])
+    mask = ec > 0
+    ts_fault = df["Timestamp"].loc[mask[mask.fillna(False)].index]
+    if len(ts_fault) < 5:
+        logger.warning("故障样本不足(%d),无法预测频率", len(ts_fault))
+        return None
+
+    hours = _to_hours(ts_fault)
+    if len(hours) == 0:
+        return None
+
+    # 按小时分箱,用 numpy 直方图统计每小时故障次数(避开 CategoricalIndex 问题)
+    bins = np.arange(0, max(hours.max(), 1) + 2, 1.0)
+    hist_counts, _ = np.histogram(hours, bins=bins)
+    # 只保留有数据的分箱(避免 0 故障小时拉低拟合)
+    nonzero_mask = hist_counts > 0
+    if nonzero_mask.sum() < 3:
+        logger.warning("故障分布过稀疏(只有 %d 个小时有故障),无法拟合",
+                        nonzero_mask.sum())
+        return None
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+    x = bin_centers[nonzero_mask]
+    y = hist_counts[nonzero_mask]
+
+    if len(x) < 3:
+        return None
+
+    a, b, r2 = _linear_fit(x, y)
+    future_x = np.linspace(x.max(), x.max() + future_hours, 50)
+    future_y = np.maximum(a * future_x + b, 0)  # 故障次数不能为负
+    resid_std = float(np.std(y - (a * x + b))) if len(y) > 2 else 1.0
+
+    return ForecastResult(
+        metric_name="故障码频率(次/小时)",
+        history_x=x, history_y=y,
+        future_x=future_x, future_y=future_y,
+        confidence_low=np.maximum(future_y - 1.96 * resid_std, 0),
+        confidence_high=future_y + 1.96 * resid_std,
+        slope=a, r2=r2,
+        interpretation=_interpret_trend(
+            a, a * 24, "故障频率", ascending_bad=True),
+        extra={"resid_std": resid_std, "bins": len(x)},
+    )
+
+
+def forecast_net_power(df: pd.DataFrame,
+                        future_hours: float) -> ForecastResult | None:
+    """预测净输出功率走势(判断电堆衰减)。"""
+    logger.info("预测净功率, 输入 %d 行, 预测 %s 小时", len(df), future_hours)
+    if "FC_NetPwrOut" not in df.columns or "Timestamp" not in df.columns:
+        return None
+
+    p = _safe_num(df["FC_NetPwrOut"])
+    p = p[(p > 0) & (p < 100000)].dropna()
+    ts = df["Timestamp"].loc[p.index]
+
+    if len(p) < 10:
+        return None
+
+    hours = _to_hours(ts)
+    if len(hours) == 0:
+        return None
+
+    df_bin = pd.DataFrame({"h": hours, "v": p.to_numpy()})
+    df_bin = df_bin.groupby(pd.cut(df_bin["h"], bins=np.arange(
+        0, df_bin["h"].max() + 1, 1.0))).mean().dropna()
+    x = df_bin["h"].to_numpy()
+    y = df_bin["v"].to_numpy()
+
+    if len(x) < 3:
+        return None
+
+    a, b, r2 = _linear_fit(x, y)
+    future_x = np.linspace(x.max(), x.max() + future_hours, 50)
+    future_y = np.maximum(a * future_x + b, 0)
+    resid_std = float(np.std(y - (a * x + b))) if len(y) > 2 else 1.0
+
+    return ForecastResult(
+        metric_name="净输出功率(kW)",
+        history_x=x, history_y=y,
+        future_x=future_x, future_y=future_y,
+        confidence_low=np.maximum(future_y - 1.96 * resid_std, 0),
+        confidence_high=future_y + 1.96 * resid_std,
+        slope=a, r2=r2,
+        interpretation=_interpret_trend(
+            a, a * 24, "净功率", ascending_bad=False),
+        extra={"resid_std": resid_std, "bins": len(x)},
+    )
+
+
+def forecast_all(df: pd.DataFrame, future_hours: float) -> list[ForecastResult]:
+    """对一个车辆 DataFrame 做全部 4 个指标预测。"""
+    results = []
+    for fn in (forecast_cell_diff, forecast_hydrogen_cumulative,
+               forecast_fault_frequency, forecast_net_power):
+        try:
+            r = fn(df, future_hours)
+            if r is not None:
+                results.append(r)
+        except Exception as e:
+            logger.error("预测 %s 失败: %s", fn.__name__, e, exc_info=True)
+    logger.info("趋势预测完成: 成功 %d / 4", len(results))
+    return results
+
+
+def fig_forecast(r: ForecastResult):
+    """把单个预测结果画成 Plotly 图(历史 + 预测 + 置信带)。"""
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    # 历史
+    fig.add_trace(go.Scatter(
+        x=r.history_x, y=r.history_y,
+        mode="markers", name="历史",
+        marker=dict(size=4, color="#1f77b4"),
+    ))
+    # 预测
+    fig.add_trace(go.Scatter(
+        x=r.future_x, y=r.future_y,
+        mode="lines", name="预测",
+        line=dict(color="#ff7f0e", width=2, dash="dash"),
+    ))
+    # 置信带
+    fig.add_trace(go.Scatter(
+        x=list(r.future_x) + list(r.future_x[::-1]),
+        y=list(r.confidence_high) + list(r.confidence_low[::-1]),
+        fill="toself", fillcolor="rgba(255,127,14,0.15)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="95% 置信区间", showlegend=False,
+    ))
+    fig.update_layout(
+        title=f"{r.metric_name} 趋势预测 (R²={r.r2:.3f})",
+        xaxis_title="时间(小时)",
+        yaxis_title=r.metric_name,
+        template="plotly_white",
+        height=350,
+        margin=dict(l=40, r=20, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return fig
