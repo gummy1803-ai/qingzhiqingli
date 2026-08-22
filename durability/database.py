@@ -40,17 +40,70 @@ _FALLBACK_BANNER = "═" * 55
 # ---------- 连接配置加载 ----------
 
 def _load_db_config() -> Dict[str, str]:
-    """从 .env 加载 MySQL 配置, 缺失字段返回空 dict。"""
-    if _ENV_PATH.exists():
-        load_dotenv(_ENV_PATH, override=True)
+    """加载 MySQL 配置,三源依次优先级覆盖:
+    1. Streamlit Cloud Secrets 面板(通过 st.secrets, 填了就优先)
+    2. 项目根目录 .env 文件(通过 python-dotenv 注入 os.environ)
+    3. 当前进程 os.environ(CI / 手动 export DB_HOST=...)
+
+    ⚠️  Streamlit Secrets 不会自动写入 os.environ, 所以我们手动把 DB_*
+    搬到 os.environ, 这样后续所有代码(不管用没用 st.secrets)都能吃到。
+    """
     keys = ["DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME"]
+
+    # --- 优先级 1:尝试从 Streamlit Cloud Secrets 回填 ---
+    try:
+        import streamlit as st  # 延迟 import, 在没有 st 上下文的命令行环境也不会崩
+        # hasattr 防止旧版本 Streamlit 没 secrets
+        secrets_keys = getattr(st, "secrets", None)
+        if secrets_keys is not None:
+            got_all = True
+            got_any = False
+            for k in keys:
+                try:
+                    v = str(secrets_keys[k]).strip() if k in secrets_keys else ""
+                except Exception:
+                    v = ""
+                if v:
+                    got_any = True
+                    os.environ[k] = v  # ← 关键:搬进 os.environ, 后续代码零改动
+                else:
+                    got_all = False
+            if got_any:
+                if got_all:
+                    logger.info(
+                        "[DB 配置] 已从 Streamlit Secrets 读取 5 项 MySQL 连接参数"
+                        " (已写入 os.environ)"
+                    )
+                else:
+                    logger.warning(
+                        "[DB 配置] Streamlit Secrets 里 MySQL 参数不完整,"
+                        " 请确认 5 个 DB_* 键名都填了"
+                    )
+    except Exception as _se:
+        # 本地 / 单元测试 / 脚本刚 import 还没进入 st 上下文:都会抛错, 静默跳过
+        logger.debug(
+            "[DB 配置] 跳过 Streamlit Secrets(非 Cloud 环境或 context 未就绪): %s", _se
+        )
+
+    # --- 优先级 2:读本地 .env (override=True 会覆盖上面 Secrets 写的值, 本地调试更灵活) ---
+    if _ENV_PATH.exists():
+        try:
+            load_dotenv(_ENV_PATH, override=True)
+            logger.info("[DB 配置] 已加载 .env 文件: %s", _ENV_PATH)
+        except Exception as _de:
+            logger.warning("[DB 配置] .env 加载失败(不影响 Cloud Secrets 逻辑): %s", _de)
+
     cfg = {k: os.getenv(k, "").strip() for k in keys}
     if all(cfg.values()):
         return cfg
     logger.warning(
-        "\n%s\n[DB 降级] .env 未配置完整 MySQL 参数, 启动即使用本地 SQLite\n"
-        "[DB 降级] 如需启用腾讯云 MySQL, 请检查 .env 中的 5 项连接参数\n%s",
-        _FALLBACK_BANNER, _FALLBACK_BANNER,
+        "\n%s\n[DB 降级] .env + Streamlit Secrets 均未提供完整 MySQL 5 项参数,"
+        " 启动即使用本地 SQLite\n"
+        "[DB 降级] 已填的参数: %s\n"
+        "[DB 降级] 如需启用腾讯云 MySQL, 请检查 .env 或 Streamlit Secrets\n%s",
+        _FALLBACK_BANNER,
+        {k: ("***" if k == "DB_PASSWORD" and cfg[k] else (cfg[k] or "(空)")) for k in keys},
+        _FALLBACK_BANNER,
     )
     return {}
 
