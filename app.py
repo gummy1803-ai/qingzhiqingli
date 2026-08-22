@@ -1090,7 +1090,35 @@ def _render_tab_bench() -> None:
     st.markdown("---")
     st.subheader("预警历史记录")
 
-    alert_events: list[dict] = []
+    # ============================================================
+    # 🚨 预警检测与飞书推送(功能4核心要求:真正发消息,不再测试模式)
+    # ============================================================
+    # ---------- ① 用户可配置预警阈值(企业默认值 50mV / 600mV) ----------
+    with st.expander("⚙️ 预警阈值与推送配置（企业默认值已填）", expanded=True):
+        cfg_cols = st.columns(4)
+        with cfg_cols[0]:
+            _dev_thresh = st.number_input(
+                "离均差上限(mV)", min_value=5.0, max_value=500.0, value=50.0, step=5.0,
+                help="FC_AvgCellVoltDev 高于此值触发预警(企业标准:50mV)",
+            )
+        with cfg_cols[1]:
+            _avg_thresh = st.number_input(
+                "平均单体电压下限(mV)", min_value=100.0, max_value=1200.0, value=600.0, step=25.0,
+                help="FC_AvgCellVoltage 低于此值且>0触发预警(企业标准:600mV)",
+            )
+        with cfg_cols[2]:
+            _rig_id = st.text_input(
+                "台架编号", value="台架A",
+                help="用于飞书消息里的台架标识(如 台架A / 测试台-01)",
+            )
+        with cfg_cols[3]:
+            _enable_push = st.checkbox(
+                "启用飞书推送", value=True,
+                help="关闭后仅记录预警事件到数据库,不发送飞书(调试用)",
+            )
+
+    # ---------- ② 命中预警事件(用用户配置的阈值) ----------
+    raw_alert_events: list[dict] = []
     if not agg_df.empty:
         dev_col = [c for c in agg_df.columns if 'AvgCellVoltDev' in c and 'mean' in c]
         avg_col = [c for c in agg_df.columns if 'AvgCellVoltage' in c and 'mean' in c]
@@ -1106,33 +1134,191 @@ def _render_tab_bench() -> None:
 
             if dev_col:
                 dev = float(row[dev_col[0]]) if pd.notna(row[dev_col[0]]) else 0
-                if dev > 50:
-                    alert_events.append({
+                if dev > _dev_thresh:
+                    raw_alert_events.append({
                         'timestamp': ts, 'cycle_id': cyc, 'power_point': pp,
-                        'condition': '离均差>50mV', 'value': dev, 'threshold': 50.0,
+                        'condition': f'离均差>{_dev_thresh:.0f}mV',
+                        'value': dev, 'threshold': float(_dev_thresh),
                         'signal': 'FC_AvgCellVoltDev', 'unit': 'mV', 'operator': '>',
                         'label': '离均差', 'data_count': cnt, 'quality': qual,
-                        'message': f"离均差>50mV: {dev:.1f}mV > 50mV",
-                        'sent': False, 'send_error': '测试模式(未发送)',
+                        'message': f"离均差>{_dev_thresh:.0f}mV: {dev:.1f}mV > {_dev_thresh:.0f}mV",
                     })
             if avg_col:
                 avg_v = float(row[avg_col[0]]) if pd.notna(row[avg_col[0]]) else 0
-                if 0 < avg_v < 600:
-                    alert_events.append({
+                if 0 < avg_v < _avg_thresh:
+                    raw_alert_events.append({
                         'timestamp': ts, 'cycle_id': cyc, 'power_point': pp,
-                        'condition': '平均单体电压<600mV', 'value': avg_v,
-                        'threshold': 600.0, 'signal': 'FC_AvgCellVoltage',
-                        'unit': 'mV', 'operator': '<', 'label': '平均单体电压',
-                        'data_count': cnt, 'quality': qual,
-                        'message': f"平均单体电压<600mV: {avg_v:.1f}mV < 600mV",
-                        'sent': False, 'send_error': '测试模式(未发送)',
+                        'condition': f'平均单体电压<{_avg_thresh:.0f}mV',
+                        'value': avg_v, 'threshold': float(_avg_thresh),
+                        'signal': 'FC_AvgCellVoltage', 'unit': 'mV', 'operator': '<',
+                        'label': '平均单体电压', 'data_count': cnt, 'quality': qual,
+                        'message': (
+                            f"平均单体电压<{_avg_thresh:.0f}mV: "
+                            f"{avg_v:.1f}mV < {_avg_thresh:.0f}mV"
+                        ),
                     })
 
-    if alert_events:
-        st.caption(f"检测到 {len(alert_events)} 条预警事件")
-        render_alert_log(alert_events)
+    # ---------- ③ 幂等 + 真实 DB 写入 + 飞书推送 ----------
+    from durability.database import (
+        db_save_event, db_get_event_status_map, db_set_event_status,
+        db_log_push, db_get_verified_contacts,
+    )
+
+    # session 级幂等:避免 Streamlit 页面 rerun 时同一事件被反复推送
+    if "_bench_push_sent_ids" not in st.session_state:
+        st.session_state["_bench_push_sent_ids"] = set()
+
+    display_events: list[dict] = []
+    if raw_alert_events:
+        # 先逐个写库,用 db_save_event 返回的真实 event_id(含 ts YmdHMS),
+        # 不自己猜算法,避免和数据库 _make_event_id 对不上
+        ev_ids: list[str] = []
+        for ev in raw_alert_events:
+            try:
+                real_eid = db_save_event(ev)  # INSERT OR IGNORE,天然幂等
+                ev_ids.append(real_eid)
+            except Exception as e:
+                logger.error("台架预警入库失败 ev=%s err=%s",
+                             f"{ev['cycle_id']}_{ev['power_point']}", e, exc_info=True)
+                ev_ids.append("")  # 失败占位
+        status_map = db_get_event_status_map([e for e in ev_ids if e])
+
+        # 哪些事件需要推送:DB里状态 != sent,且 session 级未标记已推送过
+        events_to_push: list[tuple[str, dict]] = []
+        for eid, ev in zip(ev_ids, raw_alert_events):
+            if not eid:
+                # 写库失败的事件跳过推送,但仍展示给用户
+                display_ev = dict(ev)
+                display_ev["event_id"] = "<写库失败>"
+                display_ev["db_status"] = "failed"
+                display_ev["sent"] = False
+                display_ev["send_error"] = "❌ 写数据库失败,详见日志"
+                display_events.append(display_ev)
+                continue
+            db_status = status_map.get(eid, "pending")
+            already_sent_in_session = eid in st.session_state["_bench_push_sent_ids"]
+            needs_push = (
+                _enable_push
+                and not already_sent_in_session
+                and db_status not in ("sent",)  # sent 不再重发; pending/failed/partial 都重试
+            )
+            if needs_push:
+                events_to_push.append((eid, ev))
+            # 准备展示字段(先默认用数据库状态)
+            display_ev = dict(ev)
+            display_ev["event_id"] = eid
+            display_ev["db_status"] = db_status
+            display_ev["sent"] = db_status in ("sent", "partial")
+            display_ev["send_error"] = "已推送成功" if db_status == "sent" else (
+                "部分成功" if db_status == "partial" else (
+                    f"推送失败:DB状态={db_status}" if db_status == "failed" else
+                    ("推送已关闭" if not _enable_push else "等待推送")
+                )
+            )
+            display_events.append(display_ev)
+
+        # 真正推送: 统一走 feishu_contacts.send_alert_to_contacts
+        if events_to_push:
+            from durability.feishu_contacts import send_alert_to_contacts
+            # 提前查一次已验证联系人,给用户看数量提示
+            verified_contacts = db_get_verified_contacts()
+            enabled_cnt = sum(1 for c in verified_contacts if c.get("enabled"))
+            push_status_placeholder = st.empty()
+            push_status_placeholder.warning(
+                f"📨 正在推送 {len(events_to_push)} 条预警给"
+                f" {enabled_cnt} 位已验证联系人(总配置{len(verified_contacts)}位), "
+                f"飞书限速 0.5s/人/条,请稍候..."
+            )
+
+            for eid, ev in events_to_push:
+                try:
+                    push_results = send_alert_to_contacts(ev, rig_id=_rig_id)
+                except Exception as e:
+                    logger.error("台架预警推送异常 eid=%s err=%s", eid, e, exc_info=True)
+                    push_results = []
+
+                # 写推送日志(每个联系人一条)
+                success_count = 0
+                for pr in push_results:
+                    try:
+                        db_log_push(
+                            event_id=eid,
+                            contact_id=str(pr.get("contact_id", "")),
+                            contact_name=str(pr.get("name", "")),
+                            success=bool(pr.get("success", False)),
+                            message=str(pr.get("message", "")),
+                        )
+                        if pr.get("success"):
+                            success_count += 1
+                    except Exception as e:
+                        logger.error(
+                            "台架预警推送日志写入失败 eid=%s contact=%s err=%s",
+                            eid, pr.get("name"), e, exc_info=True,
+                        )
+
+                # 汇总推送状态,写回 alert_events.status
+                total_push = len(push_results)
+                if total_push == 0:
+                    new_status = "failed"
+                elif success_count == total_push:
+                    new_status = "sent"
+                elif success_count > 0:
+                    new_status = "partial"
+                else:
+                    new_status = "failed"
+                try:
+                    db_set_event_status(eid, new_status)
+                except Exception as e:
+                    logger.error(
+                        "台架预警状态回写失败 eid=%s -> %s err=%s",
+                        eid, new_status, e, exc_info=True,
+                    )
+
+                # session 级标记已推送(防止 rerun 再次触发)
+                st.session_state["_bench_push_sent_ids"].add(eid)
+
+                # 更新 display_events 中这条的展示字段
+                for dev in display_events:
+                    if dev.get("event_id") == eid:
+                        dev["db_status"] = new_status
+                        dev["sent"] = new_status in ("sent", "partial")
+                        dev["push_summary"] = f"{success_count}/{total_push} 成功"
+                        if new_status == "sent":
+                            dev["send_error"] = f"✅ 飞书推送成功 {success_count}/{total_push}"
+                        elif new_status == "partial":
+                            dev["send_error"] = f"⚠️ 部分成功 {success_count}/{total_push}"
+                        else:
+                            fails = [f"{p.get('name','?')}:{p.get('message','')}"
+                                     for p in push_results if not p.get("success")]
+                            dev["send_error"] = (
+                                f"❌ 推送失败 {success_count}/{total_push}: "
+                                + "; ".join(fails[:2])
+                            )
+                        break
+
+            push_status_placeholder.empty()
+
+    # ---------- ④ 页面展示 ----------
+    if raw_alert_events:
+        st.caption(
+            f"检测到 {len(raw_alert_events)} 条预警事件 · "
+            f"阈值:离均差>{_dev_thresh:.0f}mV / 平均单体电压<{_avg_thresh:.0f}mV · "
+            f"飞书推送:{'✅ 启用' if _enable_push else '⛔ 已关闭(仅入库)'}"
+        )
+        # 推送结果摘要条
+        _sum_cols = st.columns(4)
+        statuses = [d.get("db_status", "pending") for d in display_events]
+        _sum_cols[0].metric(f"🎯 预警总数", f"{len(display_events)}")
+        _sum_cols[1].metric(f"✅ 已推送(sent)", f"{statuses.count('sent')}")
+        _sum_cols[2].metric(f"⚠️ 部分成功(partial)", f"{statuses.count('partial')}")
+        _sum_cols[3].metric(f"❌ 失败/待处理(failed/pending)",
+                           f"{statuses.count('failed') + statuses.count('pending')}")
+        render_alert_log(display_events)
     else:
-        st.success("✅ 当前数据无预警事件")
+        st.success(
+            f"✅ 当前数据无预警事件 · "
+            f"阈值:离均差>{_dev_thresh:.0f}mV / 平均单体电压<{_avg_thresh:.0f}mV"
+        )
 
 
 @tab_safe_render

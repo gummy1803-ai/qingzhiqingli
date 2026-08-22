@@ -314,17 +314,58 @@ def get_verified_contacts() -> List[Dict]:
 # ---------- 预警推送 (飞书 Open API) ----------
 
 def _build_alert_text(event: Dict, contact: Dict, rig_id: str) -> str:
-    """构建飞书预警消息文本(纯文本格式, 兼容性好)。"""
+    """构建台架耐久预警飞书文本(结构化+企业阈值+Tab跳转提示)。"""
     ts = event.get("timestamp", datetime.now())
     ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts)
+    cyc = event.get("cycle_id", "?")
+    pp = float(event.get("power_point", 0))
+    label = event.get("label", "")
+    operator = event.get("operator", ">")
+    value = float(event.get("value", 0))
+    threshold = float(event.get("threshold", 0))
+    unit = event.get("unit", "mV")
+    data_count = int(event.get("data_count", 0))
+    quality = event.get("quality", "正常")
+    name = contact.get("name", "老师")
 
+    # 企业标准阈值说明(根据不同条件给业务人员判断指导)
+    _std_note = ""
+    cond_key = event.get("condition", "")
+    if "离均差" in cond_key:
+        _std_note = (
+            "【企业标准】离均差反映单片电压一致性。>50mV 属于严重偏差段，建议：\n"
+            "  ① 现场检查该循环的冷却液温度是否波动\n"
+            "  ② 查看供气(氢气/空气)压力/流量是否稳定\n"
+            "  ③ 拉该 6 个功率点的 LFR/HFR 曲线确认阻抗是否同步劣化"
+        )
+    elif "平均单体电压" in cond_key:
+        _std_note = (
+            "【企业标准】平均单体电压<600mV 已进入显著衰减区。建议：\n"
+            "  ① 核对该台架的启停记录(是否频繁冷启动)\n"
+            "  ② 对比同一功率档位前 3 个循环的电压，计算衰减速率\n"
+            "  ③ 叠加极化曲线看高电流区是否塌陷(>150kW 掉压严重?)"
+        )
+    else:
+        _std_note = "【通用】请登录系统对照原始曲线复核该数据段。"
+
+    # 台架编号: 默认取 rig_id, 用户也可以在 expander 里改
     lines = [
-        f"[台架耐久预警] {rig_id} - 循环{event.get('cycle_id', '?')} 功率{event.get('power_point', 0):.1f}kW",
-        f"条件: {event.get('label', '')} {event['value']:.1f}mV {event.get('operator', '>')} 阈值{event['threshold']:.0f}mV",
-        f"数据量: {event.get('data_count', 0)}, 质量: {event.get('quality', '正常')}",
-        f"时间: {ts_str}",
-        f"接收人: {contact['name']}",
-        "查看详情: http://localhost:8501/",
+        f"🚨 氢质氢离 · 台架耐久预警通知（功能4 · 第4个 Tab）",
+        f"────────────────────────",
+        f"【台架】 {rig_id}      【循环编号】 {cyc} (每组0.5h)",
+        f"【功率点】 {pp:.1f} kW  (6档标准: 33 / 58.5 / 117 / 156 / 175.5 / 195)",
+        f"【触发条件】 {label} {value:.1f}{unit} {operator} 阈值 {threshold:.0f}{unit}",
+        f"【偏差幅度】 {abs(value - threshold):.1f}{unit} "
+        f"({'超' if operator == '>' else '低于'}阈值 {abs(value - threshold) / max(threshold, 1e-6) * 100:.1f}%)",
+        f"【样本量】 {data_count} 个数据点   【质量标记】 {quality}",
+        f"【发生时间】 {ts_str}",
+        f"────────────────────────",
+        _std_note,
+        f"────────────────────────",
+        f"接收人：{name}",
+        f"登录【🔬 台架耐久统计及预警】(第 4 个 Tab)查看原始散点图：",
+        f"  Web 版: https://qingzhiqingli-2vsualb39bebgck2jgw2bh.streamlit.app/",
+        f"  本地版: http://localhost:8501/",
     ]
     return "\n".join(lines)
 
