@@ -478,12 +478,38 @@ if docx_rows:
 st.title("📊 设备测试数据分析与自动报告助手")
 st.caption("上传或使用内置数据,自动完成合并 / 清洗 / 指标计算 / 可视化 / 一键导出报告")
 
-if not data:
-    st.warning("未检测到数据,请选择内置或上传。")
+# 🔧 Bug 修复:之前只要 data(整车 CSV) 为空就 st.stop(),
+# 导致只上传 .docx / 无Timestamp的 .xlsx(只进 dur_df 耐久数据)时页面直接停住,
+# 用户观感是"上传后没反应"。现在只要 dur_df 或 data 任一有就放行。
+if (not data) and (dur_df is None or len(dur_df) == 0):
+    st.warning(
+        "⚠️ 未检测到任何数据。\n\n"
+        "👉 上传格式提示:\n"
+        "- **整车分析**:CSV / Excel (必须含 `Timestamp` 列)\n"
+        "- **耐久分析**:Word(.docx) / Excel (不一定需 Timestamp,会进耐久 Tab)\n"
+        "- 旧版 `.doc` 请另存为 `.docx` 后再上传"
+    )
     st.stop()
+elif not data:
+    # 只有耐久数据、没有整车数据:提示但放行,允许进「耐久衰减」Tab
+    st.info(
+        f"💡 已检测到 **耐久数据 {len(dur_df)} 条** (无整车 CSV 数据)。\n\n"
+        "可直接切换到「耐久衰减」Tab 查看 docx 分析;\n"
+        "整车看板 / 燃电看板等需要 CSV Timestamp 列的 Tab 会显示空数据提示。"
+    )
+else:
+    # 有整车数据:在 info 里补充下解析到了啥耐久,让用户知道"上传真的生效了"
+    if len(dur_df):
+        st.info(
+            f"📦 上传解析结果:整车 CSV {len(data)} 辆车 · 耐久数据 {len(dur_df)} 条工步"
+            " (耐久数据在「耐久衰减」Tab 里查看)"
+        )
 
 cars = list(data.keys())
-st.success(f"已加载 {len(cars)} 辆车数据: {', '.join(cars)}  |  耐久 docx: {len(dur_df)} 条")
+if cars:
+    st.success(f"已加载 {len(cars)} 辆车数据: {', '.join(cars)}  |  耐久 docx: {len(dur_df)} 条")
+else:
+    st.success(f"已加载 耐久数据: {len(dur_df)} 条工步 (无整车 CSV,请切换到「耐久衰减」Tab)")
 
 # ---------- 主区域 Tab ----------
 
