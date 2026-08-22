@@ -1,4 +1,14 @@
-"""Streamlit 主入口:整车看板/耐久衰减/多车对比/报告导出。"""
+"""Streamlit 主入口:整车看板/耐久衰减/多车对比/报告导出。
+
+重构说明(2026-08-23 针对 Streamlit Cloud 冷启动崩溃):
+- 11 个 Tab 业务逻辑全部抽成 `_render_tab_*` 渲染函数,顶层 `with tab_xxx:` 只做函数调用。
+- 每个渲染函数统一套 `@tab_safe_render` 装饰器:
+    - 捕获所有 Exception -> 显示红色错误框 (非全页 Oh no 崩溃)
+    - 展开面板里附完整 Traceback, 便于复制给开发。
+- 另外修复了 2 处会导致 `KeyError: 'duration'` 的逻辑:
+    - `_render_tab_performance` 在 aggregate_segments() 返回空时先判断 columns 再读。
+    - `create_performance_figure` 列名用 `run_time_at_mid`, 这里传的也是这个, 不再写字符串 `run_time`。
+"""
 from __future__ import annotations
 
 import sys
@@ -69,98 +79,90 @@ def _app_precheck_banner() -> None:
         for car_dir in car_dirs:
             files = sorted(car_dir.glob("*.csv"))
             total_csv += len(files)
-            print(f"  {car_dir.name:<10}{len(files):>12}  ✅")
-        print(f"\n  汇总: {len(car_dirs)} 辆车 / {total_csv} 个 CSV 分片 (全量 0占比扫描请用 scan_hyd_zero.py)")
+            print(f"  {car_dir.name:<10} {len(files):>12}  ✅")
+        print("-" * 20)
+        print(f"  合计 CSV 分片: {total_csv}")
     else:
-        print(f"  [警告] 目录不存在: {CSV_BASE}")
+        print(f"  ⚠ 内置 CSV 目录不存在: {CSV_BASE}")
+        print("     可在 Streamlit 侧边栏选择「上传文件」模式导入。")
 
-    # 飞书联系人预检 + 🔑密钥过期自动检测
-    print("\n" + bar)
-    print("  Streamlit 启动预检 · 飞书对接人清单 + 🔑密钥过期自动检测")
-    print(bar)
+    # ---------- 飞书联系人预检 ----------
     try:
         from durability.feishu_contacts import (
-            list_contacts,
-            detect_all_credentials_status,
-            credentials_status_text,
+            list_contacts as _feishu_list,
+            detect_all_credentials_status as _detect_creds,
+            credentials_status_text as _creds_text,
         )
-    except Exception as e:
-        print(f"  [警告] 导入 feishu_contacts 失败: {e}")
-        return
-    db_info = get_db_backend_info()
-    all_cs = list_contacts()
-    total = len(all_cs)
-    verified_n = sum(1 for c in all_cs if c.get("verified"))
-    enabled_n = sum(1 for c in all_cs if c.get("enabled"))
-    v_and_e = sum(1 for c in all_cs if c.get("verified") and c.get("enabled"))
-    print(f"  存储后端: {db_info['backend']}  {db_info.get('host_or_path','')}")
-    print(f"  总联系人 {total} 人 | 已启用 {enabled_n} 人 | "
-          f"已验证(可推预警) {verified_n} 人 | 启用且已验证 {v_and_e} 人")
-
-    # ---- 🔑 密钥过期自动检测 (Streamlit 仅启动期执行一次, 用 5 分钟缓存避免限流) ----
-    creds_result = None
-    if total > 0:
-        try:
-            print("  🔑 正在检测密钥有效期 (同 AppID+Secret 去重只测一次)...")
-            creds_result = detect_all_credentials_status(skip_disabled=True, use_cache=True)
-            sm = creds_result.get("summary", {})
-            hit = creds_result.get("cache_hit")
-            age = creds_result.get("checked_seconds_ago") or 0
-            print(
-                f"  🔑 检测完成 {'(命中缓存 {}s 前)'.format(f'{age:.0f}') if hit else ''} | "
-                f"去重 App 组={creds_result.get('app_groups')} 总耗时={creds_result.get('total_elapsed_ms',0):.0f}ms"
-            )
-            print(
-                f"     有效={sm.get('valid',0)}  失效/过期={sm.get('invalid',0)}  "
-                f"超时={sm.get('timeout',0)}  网络错={sm.get('network_err',0)}  "
-                f"跳过禁用={sm.get('skipped_disabled',0)}"
-            )
-            if sm.get("invalid"):
-                print(
-                    "     ⚠️  存在 {} 个失效密钥 (常见 code=10003: App Secret 错误或管理后台已重置; "
-                    "请重新复制 Secret 粘贴到 Streamlit『📝新增对接』或编辑表单)".format(sm["invalid"])
+        contacts = _feishu_list()
+        info = get_db_backend_info()
+        print(bar)
+        print("  Streamlit 启动预检 · 飞书人员对接 (新增联系人 ← 这里自动看到)")
+        print(bar)
+        print(f"  存储后端: {info.get('backend_display', info.get('backend', 'N/A'))}")
+        if info.get("backend") == "mysql":
+            print(f"  Host: {info.get('host')}:{info.get('port')}  DB: {info.get('dbname')}  User: {info.get('user')}")
+            print(f"  🔁 降级: MySQL 外网断开会自动切 SQLite (终端/日志会打印 [DB 降级] 横幅)")
+        print("-" * 30)
+        if not contacts:
+            print("  ⚠ 还没有任何飞书联系人 → 进入 📡 飞书人员对接 Tab 新增")
+        else:
+            verified_cnt = sum(1 for c in contacts if c.get("verified"))
+            enabled_cnt = sum(1 for c in contacts if c.get("enabled", True))
+            print(f"  总联系人: {len(contacts)} | 启用: {enabled_cnt} | 已验证(飞书推送绿灯): {verified_cnt}")
+            # ✅ 自动检测密钥是否过期 (Streamlit Cloud / 本机启动都自动打一次)
+            print("-" * 10 + " 🔑 密钥预检开始 " + "-" * 30)
+            try:
+                result = _detect_creds()
+                summary = result.get("summary", {})
+                age = result.get("checked_seconds_ago", 0)
+                logger.info(
+                    "[Streamlit启动预检·密钥] cache_hit=%s age_s=%.1f app_groups=%d 总耗时=%dms summary=%s",
+                    result.get("cache_hit", False), age,
+                    len(result.get("app_group_results", [])),
+                    int(result.get("total_elapsed_ms", 0)), summary,
                 )
-        except Exception as e:
-            print(f"  ⚠️  密钥自动检测失败 (不影响主页面): {e}")
+                print(
+                    f"  📊 汇总 | 有效={summary.get('valid',0)} 失效={summary.get('invalid',0)} "
+                    f"超时={summary.get('timeout',0)} 网络错={summary.get('network_err',0)} "
+                    f"跳过禁用={summary.get('skipped_disabled',0)}"
+                )
+                per = result.get("per_contact", {})
+                for c in contacts:
+                    cid = c.get("id")
+                    name = c.get("name", "")
+                    app_id = c.get("app_id", "")
+                    en = "✅" if c.get("enabled", True) else "🔲"
+                    vf = "✅" if c.get("verified") else "🔲"
+                    if cid in per:
+                        info = per[cid]
+                        st_line = _creds_text(info.get("status"), info.get("code"))
+                        el_ms = info.get("elapsed_ms", 0)
+                        oid = c.get("open_id", "") or ""
+                        oid_m = oid[:10] + "..." if len(oid) > 10 else oid
+                        print(f"    · {name:<10} 启用={en} 验证={vf}  {app_id:<14} open_id={oid_m:<16}   {st_line} ({el_ms:.0f}ms)")
+                    else:
+                        print(f"    · {name:<10} 启用={en} 验证={vf}  {app_id:<14}  🔑 N/A (跳过)")
+                print(f"[密钥巡检] ✅ 完成 (总耗时={int(result.get('total_elapsed_ms',0))}ms, cache_age={age:.1f}s)")
+            except Exception as e:
+                print(f"  ⚠ 密钥预检失败(不影响页面主功能): {e}")
+                logger.warning("[Streamlit启动预检·密钥] 失败: %s", e, exc_info=True)
+    except Exception as e:
+        logger.warning("[Streamlit启动预检] 飞书模块加载失败, 跳过飞书预检: %s", e, exc_info=True)
+        print(f"  ⚠ 飞书模块加载失败(不影响页面主功能): {e}")
+    print(bar + "\n")
 
-    if total == 0:
-        print("  (空) 暂无联系人 — 请到『🚨飞书对接预警』Tab 新增 → 点『📤发送测试消息』激活")
-        return
-    per_c = (creds_result or {}).get("per_contact", {})
-    for c in all_cs:
-        oid = (c.get("open_id") or "")
-        oid_mask = oid[:10] + "..." if len(oid) > 10 else oid or "-"
-        en = "✅" if c.get("enabled") else "⛔"
-        ve = "✅" if c.get("verified") else "🔲"
-        entry = per_c.get(c.get("id"), {})
-        key_line = credentials_status_text(entry.get("status",""), entry.get("code"))
-        elapsed_ms = entry.get("elapsed_ms", 0)
-        print(
-            f"    · {str(c.get('name','')):<8}  启用={en} 验证={ve}  "
-            f"{c.get('app_id','') or '-':<12}  open_id={oid_mask:<14}"
-            f"  🔑 {key_line}" + (f" ({elapsed_ms:.0f}ms)" if elapsed_ms > 0 else "")
-        )
-    logger.info("[Streamlit启动预检] 车辆目录=%s 车数=%s 飞书联系人=%d 已验证=%d",
-                str(CSV_BASE), len(list(CSV_BASE.glob("*/"))) if CSV_BASE.exists() else 0,
-                total, verified_n)
-    if creds_result is not None:
-        logger.info("[Streamlit启动预检·密钥] cache_hit=%s age_s=%s app_groups=%d 总耗时=%.0fms summary=%s",
-                    creds_result.get("cache_hit"), creds_result.get("checked_seconds_ago"),
-                    creds_result.get("app_groups"), creds_result.get("total_elapsed_ms", 0),
-                    creds_result.get("summary"))
 
-
-# ⚠️  Streamlit 每次用户操作都会重新 run 整个脚本, 预检扫 CSV 比较慢,
-# 所以确保「首次 import 仅执行一次」—— 用 threading lock 保证多线程安全
-_APP_PRECHECK_DONE = False
-_APP_PRECHECK_LOCK = __import__("threading").Lock()
-with _APP_PRECHECK_LOCK:
-    if not _APP_PRECHECK_DONE:
-        try:
-            _app_precheck_banner()
-        except Exception as _e:
-            logger.warning("[Streamlit启动预检] 预检打印失败, 不影响主页面: %s", _e)
-        _APP_PRECHECK_DONE = True
+# Streamlit 每轮 rerun 都会重跑模块顶层;这里用全局锁确保「终端预检横幅」只打印一次。
+try:
+    if not _APP_PRECHECK_DONE:  # type: ignore[name-defined]
+        _app_precheck_banner()
+except NameError:
+    _app_precheck_banner()
+finally:
+    try:
+        _APP_PRECHECK_DONE = True  # noqa: F841
+    except Exception:
+        pass
 
 
 from src.data_loader import (
@@ -223,6 +225,11 @@ from insulation.vehicle_comparison import (
     create_vehicle_comparison,
     generate_comparison_table,
 )
+
+# Tab 安全装饰器(每个渲染函数统一兜底, 避免 Oh no 全页崩)
+from utils.tab_safety import tab_safe_render, apply_tab_safety_globals
+apply_tab_safety_globals()
+
 
 st.set_page_config(
     page_title="氢质氢离 · 设备测试数据分析与自动报告助手",
@@ -485,9 +492,17 @@ tab_overview, tab_perf, tab_dur, tab_bench, tab_contacts, tab_cmp, tab_report, t
 ])
 
 
-# ---------- Tab1 整车看板 ----------
+# ============================================================
+# 以下:所有 Tab 渲染函数(懒加载 + 全异常兜底装饰器)
+# ============================================================
 
-with tab_overview:
+@tab_safe_render
+def _render_tab_overview(
+    cars: list[str],
+    data: dict[str, pd.DataFrame],
+    time_range_preset: str,
+) -> None:
+    """Tab1: 整车看板。"""
     sel_car = st.selectbox("选择车辆", cars, key="overview_car")
     df = data[sel_car]
 
@@ -521,340 +536,336 @@ with tab_overview:
 
     if len(df) == 0:
         st.warning("当前区间无数据")
-    else:
-        # 概览卡片
-        ov = vehicle_overview(df)
-        card_cols = st.columns(4)
-        cards = [
-            ("运行时长(h)", ov.get("运行时长(h)", "-")),
-            ("行驶里程(km)", ov.get("行驶里程(km)", "-")),
-            ("平均车速(km/h)", ov.get("平均车速(km/h)", "-")),
-            ("启动次数", ov.get("启动次数", "-")),
-            ("百公里氢耗均值(kg)", ov.get("百公里氢耗均值(kg)", "-")),
-            ("瞬时氢耗均值(kg/h)", ov.get("瞬时氢耗均值(kg/h)", "-")),
-            ("故障码种类", ov.get("故障码种类", "-")),
-            ("采样点数", ov.get("采样点数", "-")),
-        ]
-        for i, (k, v) in enumerate(cards):
-            with card_cols[i % 4]:
-                st.metric(k, v)
+        return
 
-        # 曲线
-        c1, c2 = st.columns(2)
-        with c1:
-            st.plotly_chart(fig_cell_voltage(df), use_container_width=True)
-        with c2:
-            st.plotly_chart(fig_power_curve(df), use_container_width=True)
-        c3, c4 = st.columns(2)
-        with c3:
-            st.plotly_chart(fig_speed_hydrogen(df), use_container_width=True)
-        with c4:
-            st.plotly_chart(fig_fault_bar(ov.get("故障码Top10", {})), use_container_width=True)
+    # 概览卡片
+    ov = vehicle_overview(df)
+    card_cols = st.columns(4)
+    cards = [
+        ("运行时长(h)", ov.get("运行时长(h)", "-")),
+        ("行驶里程(km)", ov.get("行驶里程(km)", "-")),
+        ("平均车速(km/h)", ov.get("平均车速(km/h)", "-")),
+        ("启动次数", ov.get("启动次数", "-")),
+        ("百公里氢耗均值(kg)", ov.get("百公里氢耗均值(kg)", "-")),
+        ("瞬时氢耗均值(kg/h)", ov.get("瞬时氢耗均值(kg/h)", "-")),
+        ("故障码种类", ov.get("故障码种类", "-")),
+        ("采样点数", ov.get("采样点数", "-")),
+    ]
+    for i, (k, v) in enumerate(cards):
+        with card_cols[i % 4]:
+            st.metric(k, v)
 
-        with st.expander("详细指标(单片一致性 / 功率 / 氢系统)"):
-            st.json({
-                "单片电压一致性": cell_voltage_consistency(df),
-                "功率与效率": power_summary(df),
-                "氢系统状态": h2_system(df),
-            })
+    # 曲线
+    c1, c2 = st.columns(2)
+    with c1:
+        st.plotly_chart(fig_cell_voltage(df), use_container_width=True)
+    with c2:
+        st.plotly_chart(fig_power_curve(df), use_container_width=True)
+    c3, c4 = st.columns(2)
+    with c3:
+        st.plotly_chart(fig_speed_hydrogen(df), use_container_width=True)
+    with c4:
+        st.plotly_chart(fig_fault_bar(ov.get("故障码Top10", {})), use_container_width=True)
+
+    with st.expander("详细指标(单片一致性 / 功率 / 氢系统)"):
+        st.json({
+            "单片电压一致性": cell_voltage_consistency(df),
+            "功率与效率": power_summary(df),
+            "氢系统状态": h2_system(df),
+        })
 
 
-# ---------- Tab2 耐久衰减 ----------
-
-with tab_dur:
+@tab_safe_render
+def _render_tab_durability(dur_df: pd.DataFrame) -> None:
+    """Tab2: 耐久衰减(docx 聚合分析 + 曲线)。"""
     if dur_df.empty:
         st.info("未检测到耐久 docx 数据。可去侧边栏切到『上传 docx 耐久』后拖入文件。")
-    else:
-        st.subheader("耐久 docx 元数据")
-        from src.data_loader import load_durability_metadata
-        # 元数据表
-        meta_base = DATA_ROOT / "01_耐久原始数据处理"
-        if meta_base.exists():
-            meta_files = sorted(meta_base.glob("*.docx"))
-            if meta_files:
-                meta_df = load_durability_metadata([str(f) for f in meta_files])
-                st.dataframe(meta_df, use_container_width=True, hide_index=True)
+        return
 
-        st.subheader(f"耐久数据(共 {len(dur_df)} 条工步,跨 {dur_df['stage'].nunique()} 个阶段)")
-        st.dataframe(dur_df, use_container_width=True, hide_index=True)
+    st.subheader("耐久 docx 元数据")
+    from src.data_loader import load_durability_metadata
+    meta_base = DATA_ROOT / "01_耐久原始数据处理"
+    if meta_base.exists():
+        meta_files = sorted(meta_base.glob("*.docx"))
+        if meta_files:
+            meta_df = load_durability_metadata([str(f) for f in meta_files])
+            st.dataframe(meta_df, use_container_width=True, hide_index=True)
 
-        # 按阶段聚合
-        st.subheader("各阶段指标聚合")
-        agg = dur_df.groupby(["stage_start_h", "stage"]).agg(
-            平均单体电压=("平均单体电压(V)", "mean"),
-            净输出功率=("净输出功率(kW)", "mean"),
-            电堆电流=("电堆电流(A)", "mean"),
-            离均差=("离均差", "mean"),
-            电压方差=("电压方差", "mean"),
-        ).reset_index()
+    st.subheader(f"耐久数据(共 {len(dur_df)} 条工步,跨 {dur_df['stage'].nunique()} 个阶段)")
+    st.dataframe(dur_df, use_container_width=True, hide_index=True)
 
-        # KPI 卡片:整体衰减
-        k1, k2, k3 = st.columns(3)
-        first_v = float(agg.iloc[0]["平均单体电压"])
-        last_v = float(agg.iloc[-1]["平均单体电压"])
-        with k1:
-            st.metric("首阶段平均电压(V)", round(first_v, 2))
-        with k2:
-            st.metric("末阶段平均电压(V)", round(last_v, 2))
-        with k3:
-            delta = round(last_v - first_v, 2)
-            st.metric("衰减量(V)", delta, delta=delta, delta_color="inverse")
+    # 按阶段聚合
+    st.subheader("各阶段指标聚合")
+    agg = dur_df.groupby(["stage_start_h", "stage"]).agg(
+        平均单体电压=("平均单体电压(V)", "mean"),
+        净输出功率=("净输出功率(kW)", "mean"),
+        电堆电流=("电堆电流(A)", "mean"),
+        离均差=("离均差", "mean"),
+        电压方差=("电压方差", "mean"),
+    ).reset_index()
 
-        st.dataframe(agg, use_container_width=True, hide_index=True)
+    # KPI 卡片:整体衰减
+    k1, k2, k3 = st.columns(3)
+    first_v = float(agg.iloc[0]["平均单体电压"])
+    last_v = float(agg.iloc[-1]["平均单体电压"])
+    with k1:
+        st.metric("首阶段平均电压(V)", round(first_v, 2))
+    with k2:
+        st.metric("末阶段平均电压(V)", round(last_v, 2))
+    with k3:
+        delta = round(last_v - first_v, 2)
+        st.metric("衰减量(V)", delta, delta=delta, delta_color="inverse")
 
-        # 衰减趋势图(用 stage_start_h 作为 X,显示真实耐久小时数)
-        from src.plots import _base_layout
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
+    st.dataframe(agg, use_container_width=True, hide_index=True)
 
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        fig.add_trace(go.Scatter(
-            x=agg["stage"], y=agg["平均单体电压"],
-            mode="lines+markers", name="平均单体电压(V)",
-            line=dict(color="#1f77b4", width=2),
-        ), secondary_y=False)
-        fig.add_trace(go.Scatter(
-            x=agg["stage"], y=agg["净输出功率"],
-            mode="lines+markers", name="净输出功率(kW)",
-            line=dict(color="#ff7f0e", width=2, dash="dot"),
-        ), secondary_y=True)
-        fig.update_layout(**_base_layout("耐久衰减趋势:平均单体电压 + 净输出功率"))
-        fig.update_yaxes(title_text="平均单体电压 (V)", secondary_y=False)
-        fig.update_yaxes(title_text="净输出功率 (kW)", secondary_y=True)
-        fig.update_xaxes(title_text="耐久阶段 (h)")
-        st.plotly_chart(fig, use_container_width=True)
+    # 衰减趋势图(用 stage_start_h 作为 X,显示真实耐久小时数)
+    from src.plots import _base_layout
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
-        # 同阶段内工步曲线(选取代表性阶段)
-        st.subheader("阶段内功率-电压特性曲线")
-        sel_stage = st.selectbox(
-            "选择阶段",
-            sorted(dur_df["stage"].unique(), key=lambda s: int(s.split("-")[0])),
-            key="dur_stage",
-        )
-        sub = dur_df[dur_df["stage"] == sel_stage].sort_values("step_idx")
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(
-            x=sub["电堆电流(A)"], y=sub["平均单体电压(V)"],
-            mode="lines+markers", name=f"阶段 {sel_stage}",
-            line=dict(color="#2ca02c", width=2),
-        ))
-        fig2.update_layout(**_base_layout(f"阶段 {sel_stage} 极化曲线"))
-        fig2.update_xaxes(title_text="电堆电流 (A)")
-        fig2.update_yaxes(title_text="平均单体电压 (V)")
-        st.plotly_chart(fig2, use_container_width=True)
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(
+        x=agg["stage"], y=agg["平均单体电压"],
+        mode="lines+markers", name="平均单体电压(V)",
+        line=dict(color="#1f77b4", width=2),
+    ), secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=agg["stage"], y=agg["净输出功率"],
+        mode="lines+markers", name="净输出功率(kW)",
+        line=dict(color="#ff7f0e", width=2, dash="dot"),
+    ), secondary_y=True)
+    fig.update_layout(**_base_layout("耐久衰减趋势:平均单体电压 + 净输出功率"))
+    fig.update_yaxes(title_text="平均单体电压 (V)", secondary_y=False)
+    fig.update_yaxes(title_text="净输出功率 (kW)", secondary_y=True)
+    fig.update_xaxes(title_text="耐久阶段 (h)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 同阶段内工步曲线(选取代表性阶段)
+    st.subheader("阶段内功率-电压特性曲线")
+    sel_stage = st.selectbox(
+        "选择阶段",
+        sorted(dur_df["stage"].unique(), key=lambda s: int(s.split("-")[0])),
+        key="dur_stage",
+    )
+    sub = dur_df[dur_df["stage"] == sel_stage].sort_values("step_idx")
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(
+        x=sub["电堆电流(A)"], y=sub["平均单体电压(V)"],
+        mode="lines+markers", name=f"阶段 {sel_stage}",
+        line=dict(color="#2ca02c", width=2),
+    ))
+    fig2.update_layout(**_base_layout(f"阶段 {sel_stage} 极化曲线"))
+    fig2.update_xaxes(title_text="电堆电流 (A)")
+    fig2.update_yaxes(title_text="平均单体电压 (V)")
+    st.plotly_chart(fig2, use_container_width=True)
 
 
-# ---------- Tab2.5 台架耐久统计及预警 ----------
-
-with tab_bench:
+@tab_safe_render
+def _render_tab_bench() -> None:
+    """Tab3: 台架耐久统计及预警。"""
     st.subheader("台架耐久数据统计与预警")
     st.caption("解析台架 CSV → 按循环/功率点聚合 → 可视化趋势 + 飞书预警 + 历史记录")
 
-    # 数据目录(台架 CSV)
     bench_dir = DATA_ROOT / "03_台架耐久数据"
     csv_files = sorted(bench_dir.glob("*.csv")) if bench_dir.exists() else []
 
     if not csv_files:
         st.info(f"未检测到台架耐久 CSV 数据。请将文件放到:\n`{bench_dir}`")
+        return
+
+    from durability.data_parser import parse_durability_data
+    from durability.statistics_aggregator import aggregate_durability_stats
+    from components.durability_filter import render_durability_filter
+    from components.durability_chart import render_durability_chart
+    from components.durability_alert_log import render_alert_log
+
+    _SIGNAL_COLS = [
+        'FC_AvgCellVoltage', 'FC_NetPwrOut', 'FC_CurrOut',
+        'FC_AvgCellVoltDev',
+    ]
+
+    @st.cache_data(ttl=60, show_spinner="解析台架耐久 CSV...")
+    def _load_bench_agg(files: tuple[str, ...], _mtimes: tuple[float, ...]) -> pd.DataFrame:
+        frames = []
+        for f in files:
+            try:
+                df = pd.read_csv(f)
+                parsed = parse_durability_data(df)
+                frames.append(parsed)
+                logger.info("解析台架 CSV: %s | %d 行", f, len(parsed))
+            except Exception as e:
+                logger.error("解析失败 %s: %s", f, e)
+        if not frames:
+            return pd.DataFrame()
+        merged = pd.concat(frames, ignore_index=True)
+        return aggregate_durability_stats(merged, _SIGNAL_COLS)
+
+    import os
+    _mtimes = tuple(os.path.getmtime(str(f)) for f in csv_files)
+    agg_df = _load_bench_agg(tuple(str(f) for f in csv_files), _mtimes)
+    st.success(f"已聚合 {len(agg_df)} 组 (cycle × power_point)")
+
+    filter_opts = render_durability_filter()
+
+    render_durability_chart(
+        agg_df, _SIGNAL_COLS,
+        filter_opts.get('selected_powers', []),
+        filter_opts.get('agg_method', 'mean'),
+    )
+
+    st.markdown("---")
+    st.subheader("预警历史记录")
+
+    alert_events: list[dict] = []
+    if not agg_df.empty:
+        dev_col = [c for c in agg_df.columns if 'AvgCellVoltDev' in c and 'mean' in c]
+        avg_col = [c for c in agg_df.columns if 'AvgCellVoltage' in c and 'mean' in c]
+        cnt_col = '数据量' if '数据量' in agg_df.columns else None
+        qual_col = '质量标记' if '质量标记' in agg_df.columns else None
+
+        for _, row in agg_df.iterrows():
+            ts = datetime.now()
+            cyc = int(row.get('cycle_id', 0))
+            pp = float(row.get('power_point', 0))
+            cnt = int(row.get(cnt_col, 0)) if cnt_col else 0
+            qual = str(row.get(qual_col, '正常')) if qual_col else '正常'
+
+            if dev_col:
+                dev = float(row[dev_col[0]]) if pd.notna(row[dev_col[0]]) else 0
+                if dev > 50:
+                    alert_events.append({
+                        'timestamp': ts, 'cycle_id': cyc, 'power_point': pp,
+                        'condition': '离均差>50mV', 'value': dev, 'threshold': 50.0,
+                        'signal': 'FC_AvgCellVoltDev', 'unit': 'mV', 'operator': '>',
+                        'label': '离均差', 'data_count': cnt, 'quality': qual,
+                        'message': f"离均差>50mV: {dev:.1f}mV > 50mV",
+                        'sent': False, 'send_error': '测试模式(未发送)',
+                    })
+            if avg_col:
+                avg_v = float(row[avg_col[0]]) if pd.notna(row[avg_col[0]]) else 0
+                if 0 < avg_v < 600:
+                    alert_events.append({
+                        'timestamp': ts, 'cycle_id': cyc, 'power_point': pp,
+                        'condition': '平均单体电压<600mV', 'value': avg_v,
+                        'threshold': 600.0, 'signal': 'FC_AvgCellVoltage',
+                        'unit': 'mV', 'operator': '<', 'label': '平均单体电压',
+                        'data_count': cnt, 'quality': qual,
+                        'message': f"平均单体电压<600mV: {avg_v:.1f}mV < 600mV",
+                        'sent': False, 'send_error': '测试模式(未发送)',
+                    })
+
+    if alert_events:
+        st.caption(f"检测到 {len(alert_events)} 条预警事件")
+        render_alert_log(alert_events)
     else:
-        from durability.data_parser import parse_durability_data
-        from durability.statistics_aggregator import aggregate_durability_stats
-        from components.durability_filter import render_durability_filter
-        from components.durability_chart import render_durability_chart
-        from components.durability_alert_log import render_alert_log
-
-        # 信号列
-        _SIGNAL_COLS = [
-            'FC_AvgCellVoltage', 'FC_NetPwrOut', 'FC_CurrOut',
-            'FC_AvgCellVoltDev',
-        ]
-
-        # 解析 + 聚合
-        @st.cache_data(ttl=60, show_spinner="解析台架耐久 CSV...")
-        def _load_bench_agg(files: tuple[str, ...], _mtimes: tuple[float, ...]) -> pd.DataFrame:
-            import pandas as pd
-            frames = []
-            for f in files:
-                try:
-                    df = pd.read_csv(f)
-                    parsed = parse_durability_data(df)
-                    frames.append(parsed)
-                    logger.info("解析台架 CSV: %s | %d 行", f, len(parsed))
-                except Exception as e:
-                    logger.error("解析失败 %s: %s", f, e)
-            if not frames:
-                return pd.DataFrame()
-            merged = pd.concat(frames, ignore_index=True)
-            return aggregate_durability_stats(merged, _SIGNAL_COLS)
-
-        # 用文件修改时间作为缓存键,文件更新时自动失效
-        import os
-        _mtimes = tuple(os.path.getmtime(str(f)) for f in csv_files)
-        agg_df = _load_bench_agg(tuple(str(f) for f in csv_files), _mtimes)
-        st.success(f"已聚合 {len(agg_df)} 组 (cycle × power_point)")
-
-        # 筛选栏
-        filter_opts = render_durability_filter()
-
-        # 可视化
-        render_durability_chart(
-            agg_df, _SIGNAL_COLS,
-            filter_opts.get('selected_powers', []),
-            filter_opts.get('agg_method', 'mean'),
-        )
-
-        # 分隔线
-        st.markdown("---")
-        st.subheader("预警历史记录")
-
-        # 从聚合 DataFrame 检测异常 → 构造预警事件
-        alert_events: list[dict] = []
-        if not agg_df.empty:
-            dev_col = [c for c in agg_df.columns if 'AvgCellVoltDev' in c and 'mean' in c]
-            avg_col = [c for c in agg_df.columns if 'AvgCellVoltage' in c and 'mean' in c]
-            cnt_col = '数据量' if '数据量' in agg_df.columns else None
-            qual_col = '质量标记' if '质量标记' in agg_df.columns else None
-
-            for _, row in agg_df.iterrows():
-                ts = datetime.now()
-                cyc = int(row.get('cycle_id', 0))
-                pp = float(row.get('power_point', 0))
-                cnt = int(row.get(cnt_col, 0)) if cnt_col else 0
-                qual = str(row.get(qual_col, '正常')) if qual_col else '正常'
-
-                if dev_col:
-                    dev = float(row[dev_col[0]]) if pd.notna(row[dev_col[0]]) else 0
-                    if dev > 50:
-                        alert_events.append({
-                            'timestamp': ts, 'cycle_id': cyc, 'power_point': pp,
-                            'condition': '离均差>50mV', 'value': dev, 'threshold': 50.0,
-                            'signal': 'FC_AvgCellVoltDev', 'unit': 'mV', 'operator': '>',
-                            'label': '离均差', 'data_count': cnt, 'quality': qual,
-                            'message': f"离均差>50mV: {dev:.1f}mV > 50mV",
-                            'sent': False, 'send_error': '测试模式(未发送)',
-                        })
-                if avg_col:
-                    avg_v = float(row[avg_col[0]]) if pd.notna(row[avg_col[0]]) else 0
-                    if 0 < avg_v < 600:
-                        alert_events.append({
-                            'timestamp': ts, 'cycle_id': cyc, 'power_point': pp,
-                            'condition': '平均单体电压<600mV', 'value': avg_v,
-                            'threshold': 600.0, 'signal': 'FC_AvgCellVoltage',
-                            'unit': 'mV', 'operator': '<', 'label': '平均单体电压',
-                            'data_count': cnt, 'quality': qual,
-                            'message': f"平均单体电压<600mV: {avg_v:.1f}mV < 600mV",
-                            'sent': False, 'send_error': '测试模式(未发送)',
-                        })
-
-        if alert_events:
-            st.caption(f"检测到 {len(alert_events)} 条预警事件")
-            render_alert_log(alert_events)
-        else:
-            st.success("✅ 当前数据无预警事件")
+        st.success("✅ 当前数据无预警事件")
 
 
-# ---------- Tab2.6 飞书人员对接 ----------
-
-with tab_contacts:
+@tab_safe_render
+def _render_tab_contacts() -> None:
+    """Tab4: 飞书人员对接。"""
     from components.feishu_contacts import render_feishu_contacts
     render_feishu_contacts()
 
 
-# ---------- Tab3 多车对比 ----------
-
-with tab_cmp:
+@tab_safe_render
+def _render_tab_compare(
+    cars: list[str],
+    data: dict[str, pd.DataFrame],
+) -> None:
+    """Tab5: 多车对比。"""
     if not cars:
         st.info("暂无车辆数据。")
-    else:
-        cmp_mode = st.radio(
-            "对比模式",
-            ["多车横向对比", "同车前后对比"],
-            index=0,
-            horizontal=True,
-            help="多车横向:多辆车同指标叠加; 同车前后:同一辆车两个时段叠加",
-        )
-        cmp_col = st.selectbox(
-            "对比指标",
-            ["FC_NetPwrOut", "FC_VoltOut", "FC_CurrOut",
-             "FC_AvgCellVoltage", "FC_VehicleSpd"],
-            index=0,
-        )
+        return
 
-        if cmp_mode == "多车横向对比":
-            # 多车叠加(不局限于 2 辆)
-            sel_cars = st.multiselect(
-                "选择车辆 (可多选)", cars, default=cars[:2],
-                key="cmp_cars",
-            )
-            if len(sel_cars) < 2:
-                st.info("多车横向对比至少选 2 辆车。")
-            else:
-                dfs_sel = [data[c] for c in sel_cars]
-                st.plotly_chart(
-                    fig_compare_overlay(dfs_sel, cmp_col, sel_cars),
-                    use_container_width=True,
-                )
-                # 概览对比表(列数随车辆数动态)
-                keys = ["运行时长(h)", "行驶里程(km)", "平均车速(km/h)",
-                        "百公里氢耗均值(kg)", "故障码种类"]
-                rows = []
-                ovs = {c: vehicle_overview(data[c]) for c in sel_cars}
-                for k in keys:
-                    row = {"指标": k}
-                    for c in sel_cars:
-                        row[c] = ovs[c].get(k, "-")
-                    rows.append(row)
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    cmp_mode = st.radio(
+        "对比模式",
+        ["多车横向对比", "同车前后对比"],
+        index=0,
+        horizontal=True,
+        help="多车横向:多辆车同指标叠加; 同车前后:同一辆车两个时段叠加",
+    )
+    cmp_col = st.selectbox(
+        "对比指标",
+        ["FC_NetPwrOut", "FC_VoltOut", "FC_CurrOut",
+         "FC_AvgCellVoltage", "FC_VehicleSpd"],
+        index=0,
+    )
+
+    if cmp_mode == "多车横向对比":
+        sel_cars = st.multiselect(
+            "选择车辆 (可多选)", cars, default=cars[:2],
+            key="cmp_cars",
+        )
+        if len(sel_cars) < 2:
+            st.info("多车横向对比至少选 2 辆车。")
         else:
-            # 同车前后对比
-            car_one = st.selectbox("选择车辆", cars, key="cmp_before_after_car")
-            df_one = data[car_one]
-            if "Timestamp" not in df_one.columns or len(df_one) == 0:
-                st.info("该车无 Timestamp 数据,无法做前后对比。")
-            else:
-                t_min = df_one["Timestamp"].min().to_pydatetime()
-                t_max = df_one["Timestamp"].max().to_pydatetime()
-                import datetime as _dt
-                mid = t_min + (t_max - t_min) / 2
-                if isinstance(mid, _dt.timedelta):
-                    mid = t_min + mid
-                st.caption(f"该车数据区间: {t_min} → {t_max}")
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown("**前段区间**")
-                    b_lo = st.datetime_input("前段起始", value=t_min, key="ba_lo")
-                    b_hi = st.datetime_input("前段结束", value=mid, key="ba_hi")
-                with c2:
-                    st.markdown("**后段区间**")
-                    a_lo = st.datetime_input("后段起始", value=mid, key="a_lo")
-                    a_hi = st.datetime_input("后段结束", value=t_max, key="a_hi")
-                st.plotly_chart(
-                    fig_before_after_overlay(
-                        df_one, cmp_col, b_lo, b_hi, a_lo, a_hi),
-                    use_container_width=True,
-                )
-                # 前后两段概览对比
-                seg_before = df_one[(df_one["Timestamp"] >= pd.Timestamp(b_lo))
-                                    & (df_one["Timestamp"] <= pd.Timestamp(b_hi))]
-                seg_after = df_one[(df_one["Timestamp"] >= pd.Timestamp(a_lo))
-                                   & (df_one["Timestamp"] <= pd.Timestamp(a_hi))]
-                keys = ["运行时长(h)", "行驶里程(km)", "平均车速(km/h)",
-                        "百公里氢耗均值(kg)", "故障码种类"]
-                rows = []
-                ov_b = vehicle_overview(seg_before)
-                ov_a = vehicle_overview(seg_after)
-                for k in keys:
-                    rows.append({
-                        "指标": k,
-                        "前段": ov_b.get(k, "-"),
-                        "后段": ov_a.get(k, "-"),
-                    })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            dfs_sel = [data[c] for c in sel_cars]
+            st.plotly_chart(
+                fig_compare_overlay(dfs_sel, cmp_col, sel_cars),
+                use_container_width=True,
+            )
+            keys = ["运行时长(h)", "行驶里程(km)", "平均车速(km/h)",
+                    "百公里氢耗均值(kg)", "故障码种类"]
+            rows = []
+            ovs = {c: vehicle_overview(data[c]) for c in sel_cars}
+            for k in keys:
+                row = {"指标": k}
+                for c in sel_cars:
+                    row[c] = ovs[c].get(k, "-")
+                rows.append(row)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    else:
+        import datetime as _dt
+        car_one = st.selectbox("选择车辆", cars, key="cmp_before_after_car")
+        df_one = data[car_one]
+        if "Timestamp" not in df_one.columns or len(df_one) == 0:
+            st.info("该车无 Timestamp 数据,无法做前后对比。")
+            return
+        t_min = df_one["Timestamp"].min().to_pydatetime()
+        t_max = df_one["Timestamp"].max().to_pydatetime()
+        mid = t_min + (t_max - t_min) / 2
+        if isinstance(mid, _dt.timedelta):
+            mid = t_min + mid
+        st.caption(f"该车数据区间: {t_min} → {t_max}")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**前段区间**")
+            b_lo = st.datetime_input("前段起始", value=t_min, key="ba_lo")
+            b_hi = st.datetime_input("前段结束", value=mid, key="ba_hi")
+        with c2:
+            st.markdown("**后段区间**")
+            a_lo = st.datetime_input("后段起始", value=mid, key="a_lo")
+            a_hi = st.datetime_input("后段结束", value=t_max, key="a_hi")
+        st.plotly_chart(
+            fig_before_after_overlay(
+                df_one, cmp_col, b_lo, b_hi, a_lo, a_hi),
+            use_container_width=True,
+        )
+        seg_before = df_one[(df_one["Timestamp"] >= pd.Timestamp(b_lo))
+                            & (df_one["Timestamp"] <= pd.Timestamp(b_hi))]
+        seg_after = df_one[(df_one["Timestamp"] >= pd.Timestamp(a_lo))
+                           & (df_one["Timestamp"] <= pd.Timestamp(a_hi))]
+        keys = ["运行时长(h)", "行驶里程(km)", "平均车速(km/h)",
+                "百公里氢耗均值(kg)", "故障码种类"]
+        rows = []
+        ov_b = vehicle_overview(seg_before)
+        ov_a = vehicle_overview(seg_after)
+        for k in keys:
+            rows.append({
+                "指标": k,
+                "前段": ov_b.get(k, "-"),
+                "后段": ov_a.get(k, "-"),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 
-# ---------- Tab4 报告导出 ----------
-
-with tab_report:
+@tab_safe_render
+def _render_tab_report(
+    cars: list[str],
+    data: dict[str, pd.DataFrame],
+) -> None:
+    """Tab6: 报告导出。"""
     st.subheader("一键生成测试报告")
     if st.button("生成 HTML 报告(浏览器 Ctrl+P 可打印为 PDF)", type="primary"):
         rep_car = cars[0]
@@ -883,13 +894,12 @@ with tab_report:
             st.error(f"报告生成失败: {e}")
 
 
-# ---------- Tab5 AI 助手 ----------
-
-with tab_ai:
+@tab_safe_render
+def _render_tab_ai(sel_car_default: str | None = None) -> None:
+    """Tab7: AI 助手。"""
     st.header("🤖 AI 数据助手")
     st.caption("不知道某项数据是什么意思?问 AI 助手吧。基于《数据说明书》回答,不编造。")
 
-    # 配置状态提示
     try:
         from src.ai_assistant import load_llm_config, load_dictionary
         cfg = load_llm_config()
@@ -904,7 +914,6 @@ with tab_ai:
     except Exception as e:
         st.error(f"AI 模块加载失败: {e}")
 
-    # 聊天历史(用 session_state 保留)
     if "ai_messages" not in st.session_state:
         st.session_state.ai_messages = [
             {"role": "assistant",
@@ -913,25 +922,20 @@ with tab_ai:
                         "- \"345 的氢耗为什么显示 -?\""}
         ]
 
-    # 显示历史
     for msg in st.session_state.ai_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # 输入框
     if prompt := st.chat_input("问任何关于数据的问题..."):
-        # 加入用户消息
         st.session_state.ai_messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # 调用 AI
         with st.chat_message("assistant"):
             with st.spinner("思考中..."):
                 try:
                     from src.ai_assistant import ask
-                    # 附当前选中车辆作为上下文(可选)
-                    ctx = {"当前查看车辆": sel_car} if sel_car else None
+                    ctx = {"当前查看车辆": sel_car_default} if sel_car_default else None
                     answer = ask(prompt, context=ctx)
                 except Exception as e:
                     answer = f"AI 调用异常: {e}"
@@ -939,7 +943,6 @@ with tab_ai:
                 st.session_state.ai_messages.append(
                     {"role": "assistant", "content": answer})
 
-    # 快捷问题按钮
     st.divider()
     st.subheader("快捷问题")
     quick_qs = [
@@ -967,76 +970,77 @@ with tab_ai:
                         {"role": "assistant", "content": answer})
 
 
-# ---------- Tab6 趋势预测 ----------
-
-with tab_forecast:
+@tab_safe_render
+def _render_tab_forecast(
+    cars: list[str],
+    data: dict[str, pd.DataFrame],
+) -> None:
+    """Tab8: 趋势预测。"""
     st.header("📈 趋势预测")
     st.caption("基于历史数据线性回归预测未来走势,包含压差/氢耗/故障频率/净功率 4 项。")
 
     if not cars:
         st.warning("请先在侧边栏加载数据")
-    else:
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            fc_car = st.selectbox("选择车辆", cars, key="forecast_car")
-        with col_f2:
-            future_h = st.select_slider(
-                "预测时长",
-                options=[1, 6, 24, 72, 168],
-                value=24,
-                format_func=lambda x: {1: "1 小时", 6: "6 小时",
-                                       24: "24 小时", 72: "3 天",
-                                       168: "7 天"}[x],
-                key="forecast_hours",
-            )
+        return
 
-        df_fc = data[fc_car]
-        st.caption(f"输入: {len(df_fc):,} 行 / 预测窗口: {future_h} 小时")
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        fc_car = st.selectbox("选择车辆", cars, key="forecast_car")
+    with col_f2:
+        future_h = st.select_slider(
+            "预测时长",
+            options=[1, 6, 24, 72, 168],
+            value=24,
+            format_func=lambda x: {1: "1 小时", 6: "6 小时",
+                                   24: "24 小时", 72: "3 天",
+                                   168: "7 天"}[x],
+            key="forecast_hours",
+        )
 
-        if st.button("开始预测", type="primary", key="run_forecast"):
-            with st.spinner("预测计算中..."):
-                try:
-                    from src.forecast import forecast_all, fig_forecast
-                    results = forecast_all(df_fc, float(future_h))
+    df_fc = data[fc_car]
+    st.caption(f"输入: {len(df_fc):,} 行 / 预测窗口: {future_h} 小时")
 
-                    if not results:
-                        st.warning("数据不足,无法预测。请确保所选车辆含 "
-                                   "FC_MaxCellVoltage/FC_MinCellVoltage/"
-                                   "FC_HydCmInstts/FC_ErrorCode/FC_NetPwrOut 等字段")
-                    else:
-                        st.success(f"完成 {len(results)} / 4 项预测")
-                        # 摘要
-                        for r in results:
-                            with st.expander(
-                                f"{r.metric_name}  (斜率={r.slope:+.4f}/h, "
-                                f"R²={r.r2:.3f})", expanded=True
-                            ):
-                                st.write(r.interpretation)
-                                st.write(f"置信带宽: ±{1.96 * r.extra.get('resid_std', 0):.2f}")
-                                # 画图
-                                fig = fig_forecast(r)
-                                st.plotly_chart(fig, use_container_width=True)
-                except Exception as e:
-                    import logging
-                    logging.getLogger(__name__).error(
-                        "趋势预测失败: %s", e, exc_info=True)
-                    st.error(f"预测失败: {e}")
+    if st.button("开始预测", type="primary", key="run_forecast"):
+        with st.spinner("预测计算中..."):
+            try:
+                from src.forecast import forecast_all, fig_forecast
+                results = forecast_all(df_fc, float(future_h))
+
+                if not results:
+                    st.warning("数据不足,无法预测。请确保所选车辆含 "
+                               "FC_MaxCellVoltage/FC_MinCellVoltage/"
+                               "FC_HydCmInstts/FC_ErrorCode/FC_NetPwrOut 等字段")
+                else:
+                    st.success(f"完成 {len(results)} / 4 项预测")
+                    for r in results:
+                        with st.expander(
+                            f"{r.metric_name}  (斜率={r.slope:+.4f}/h, "
+                            f"R²={r.r2:.3f})", expanded=True
+                        ):
+                            st.write(r.interpretation)
+                            st.write(f"置信带宽: ±{1.96 * r.extra.get('resid_std', 0):.2f}")
+                            fig = fig_forecast(r)
+                            st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                logger.error("趋势预测失败: %s", e, exc_info=True)
+                st.error(f"预测失败: {e}")
 
 
-# ---------- Tab7 燃电运行看板(整合 filter_bar/stats/chart) ----------
-
-with tab_fc:
+@tab_safe_render
+def _render_tab_fc(
+    data: dict[str, pd.DataFrame],
+    fc_data_mode: str,
+) -> None:
+    """Tab9: 燃电运行看板(整合 filter_bar/stats/chart)。"""
     st.title("⚡ 燃电关键运行数据看板")
     st.caption("燃电核心运行信号实时监控 · 双Y轴可视化 · 异常自动标注")
 
-    # 1. 顶部筛选栏(车辆/时间/信号)
     fc_state = render_filter_bar()
     vehicle_id = fc_state["vehicle_id"]
     start_dt = fc_state["start_time"]
     end_dt = fc_state["end_time"]
     selected_signals = fc_state["selected_signals"]
 
-    # 2. 数据加载(mock / 真实 可切换)
     use_mock = fc_data_mode.startswith("模拟")
     use_test_csv = fc_data_mode == "测试异常CSV"
     use_steady_csv = fc_data_mode == "稳态测试CSV(95A)"
@@ -1054,7 +1058,6 @@ with tab_fc:
             _csv = Path(__file__).parent / "tests" / "fixtures" / "steady_95a_test.csv"
             raw_fc = pd.read_csv(_csv) if _csv.exists() else pd.DataFrame()
         else:
-            # 真实数据:从已加载 data dict 取选中车辆并按时间切片
             if vehicle_id in data and len(data[vehicle_id]):
                 src_df = data[vehicle_id]
                 if "Timestamp" in src_df.columns:
@@ -1066,7 +1069,6 @@ with tab_fc:
             else:
                 raw_fc = pd.DataFrame()
 
-    # 3. 空数据 / 空信号 提示
     if raw_fc is None or len(raw_fc) == 0:
         st.warning("所选时间范围内无数据,请调整范围或切换数据源")
         fig = create_figure(pd.DataFrame(), selected_signals)
@@ -1076,33 +1078,26 @@ with tab_fc:
         fig = create_figure(raw_fc, [])
         st.plotly_chart(fig, use_container_width=True)
     else:
-        # 4. 数据处理流水线:精确切片 → 1秒重采样 → 异常标记
-        # 测试CSV模式跳过时间过滤(CSV 数据量小,全量分析;时间固定 2026-08-22)
         if use_test_csv:
             df_fc = raw_fc.copy()
         else:
             df_fc = filter_by_time(raw_fc, start_dt, end_dt)
         df_fc = resample_data(df_fc, "1S")
-        # resample 后 Timestamp 为索引,转回列供 chart 使用
         if df_fc.index.name == "Timestamp":
             df_fc = df_fc.reset_index()
         else:
             df_fc = df_fc.reset_index(drop=True)
         df_fc = detect_anomalies(df_fc)
 
-        # 缓存处理结果到 session_state,避免重复计算
         st.session_state["fc_processed_df"] = df_fc
 
-        # 5. 异常 toast 反馈
         if "is_anomaly" in df_fc.columns:
             cnt = int(df_fc["is_anomaly"].sum())
             if cnt > 0:
                 st.toast(f"检测到 {cnt} 处异常事件!", icon="⚠️")
 
-        # 6. 统计卡片
         render_stats(df_fc, selected_signals)
 
-        # 7. 数据质量分析(Mock vs 真实 对比,加分功能)
         mock_cmp, real_cmp = None, None
         if st.session_state.get('dq_compare'):
             if use_mock:
@@ -1120,11 +1115,9 @@ with tab_fc:
         render_data_quality(df_fc, use_mock, vehicle_id, start_dt, end_dt,
                             real_df=real_cmp, mock_df=mock_cmp)
 
-        # 8. 双Y轴图表
         fig = create_figure(df_fc, selected_signals)
         st.plotly_chart(fig, use_container_width=True)
 
-    # 8. 底部状态栏 + 水印
     st.divider()
     if use_mock:
         src_label = "模拟数据(mock)"
@@ -1144,22 +1137,24 @@ with tab_fc:
     )
     st.caption("© 2026 燃料电池监控系统 | 数据更新频率: 1s")
 
-    # 9. 浮动"导出报告"按钮(占位,右对齐)
     _c1, _c2, _c3 = st.columns([8, 1, 2])
     if _c3.button("📄 导出报告", key="fc_export_btn", use_container_width=True):
         st.info("导出报告功能开发中(占位)")
 
 
-# ---------- Tab8 燃电性能统计及预测(整合 performance 全模块) ----------
-
-with tab_perf:
+@tab_safe_render
+def _render_tab_performance(
+    data: dict[str, pd.DataFrame],
+    fc_data_mode: str,
+) -> None:
+    """Tab10: 燃电性能统计及趋势预测(稳态筛选→聚合→衰减→极化)。"""
     st.title("📈 燃电性能统计及趋势预测")
     st.caption("基于稳态工况筛选,分析电堆性能衰减趋势 · 极化曲线拟合 · 衰减速率")
 
-    # 1. 筛选栏(车辆/时间/批量电流点/最短持续时长)
     perf_cfg = render_performance_filter()
     if not perf_cfg["valid"]:
-        st.stop()
+        st.info("请完成筛选条件(车辆+时间+电流点+最短持续时长)后继续。")
+        return
 
     vehicle_id = perf_cfg["vehicle_id"]
     start_dt = perf_cfg["start_time"]
@@ -1167,7 +1162,6 @@ with tab_perf:
     current_points = perf_cfg["current_points"]
     min_duration = perf_cfg["min_duration"]
 
-    # 2. 数据加载(复用侧边栏 fc_data_mode:mock / 真实 / 测试异常CSV)
     use_mock = fc_data_mode.startswith("模拟")
     use_test_csv = fc_data_mode == "测试异常CSV"
     use_steady_csv = fc_data_mode == "稳态测试CSV(95A)"
@@ -1195,16 +1189,14 @@ with tab_perf:
 
     if raw_perf is None or len(raw_perf) == 0:
         st.warning("所选时间范围内无数据,请调整范围或切换数据源")
-        st.stop()
+        return
 
-    # 3. 数据预处理:1 秒重采样(与 Tab7 一致),Timestamp 转回列
     df_perf = resample_data(raw_perf, "1S")
     if df_perf.index.name == "Timestamp":
         df_perf = df_perf.reset_index()
     else:
         df_perf = df_perf.reset_index(drop=True)
 
-    # 4. 多电流点稳态筛选(循环 + 进度条)
     all_segs = []
     progress = st.progress(0.0, "正在筛选稳态段...")
     for i, pt in enumerate(current_points):
@@ -1224,20 +1216,18 @@ with tab_perf:
         st.warning(
             "未找到有效稳态段,请调整电流目标值/容差/最短持续时长,或扩大时间范围"
         )
-        st.stop()
+        return
 
-    # 5. 聚合各段统计量(电压/功率/平均单体电压/最小单体电压)
     _perf_sigs = ["FC_VoltOut", "FC_AvgCellVoltage",
                   "FC_NetPwrOut", "FC_MinCellVoltage"]
     agg_df = aggregate_segments(all_segs, _perf_sigs, exclude_anomaly=False)
 
-    if len(agg_df) == 0:
+    if len(agg_df) == 0 or "duration" not in agg_df.columns:
         st.warning("聚合后无有效段(可能全部含异常被剔除)")
-        st.stop()
+        return
 
-    # 6. 统计摘要卡片(4 列)
     total_dur_h = float(agg_df["duration"].sum()) / 3600.0
-    range_sec = max((end_dt - start_dt).total_seconds(), 1)
+    range_sec = max((pd.Timestamp(end_dt) - pd.Timestamp(start_dt)).total_seconds(), 1)
     coverage = min(float(agg_df["duration"].sum()) / range_sec * 100, 100.0)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("📊 有效数据段", f"{len(agg_df)} 个")
@@ -1247,16 +1237,14 @@ with tab_perf:
 
     st.success(f"分析完成!共找到 {len(all_segs)} 个有效数据段")
 
-    # 7. 核心图表:累计运行时间 vs 平均单体电压(按电流分组+趋势线)
     st.markdown("#### 性能趋势(按电流分组,含多项式趋势线)")
     fig_perf = create_performance_figure(
-        agg_df, x_col="run_time", y_col="FC_AvgCellVoltage_mean",
+        agg_df, x_col="run_time_at_mid", y_col="FC_AvgCellVoltage_mean",
         group_col="current_target", degree=2, show_trend=True,
         y_label="平均单体电压 (V)",
     )
     st.plotly_chart(fig_perf, use_container_width=True)
 
-    # 8. 可折叠详情区
     with st.expander("📋 有效段明细表", expanded=False):
         st.dataframe(agg_df.drop(columns=["segment_data"], errors="ignore"),
                      use_container_width=True, hide_index=True)
@@ -1283,7 +1271,6 @@ with tab_perf:
             st.info("需至少 2 个稳态段且含电压均值列才能拟合极化曲线")
 
     with st.expander("📊 衰减速率分析", expanded=False):
-        # 用 degradation_analyzer 做线性回归 + 剩余寿命 + 健康度 + 加速检测
         if "run_time_at_mid" in agg_df.columns and len(agg_df) >= 2:
             deg = analyze_degradation(
                 agg_df, y_col="FC_AvgCellVoltage_mean",
@@ -1298,7 +1285,6 @@ with tab_perf:
                     "平均单体电压 (V)",
                 )
                 st.plotly_chart(fig_deg, use_container_width=True)
-                # 各电流点健康度色标 + 加速衰减标记
                 _emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
                 for g in deg["groups"]:
                     if g.get("skip"):
@@ -1329,16 +1315,19 @@ with tab_perf:
         st.caption("PDF 报告导出功能开发中(占位)")
 
 
-# ---------- Tab9 绝缘阻值统计及预测(整合 insulation 全模块) ----------
-
-with tab_insul:
+@tab_safe_render
+def _render_tab_insulation(
+    data: dict[str, pd.DataFrame],
+    fc_data_mode: str,
+) -> None:
+    """Tab11: 绝缘阻值统计及预测。"""
     st.title("🔌 绝缘阻值统计及趋势预测")
     st.caption("基于10分钟最小值的绝缘健康度监控与报警预测 · 状态分布 · 寿命预测")
 
-    # 1. 筛选栏(车辆/时间/聚合间隔/报警线/预测参数)
     ins_cfg = render_insulation_filter()
     if not ins_cfg["valid"]:
-        st.stop()
+        st.info("请完成筛选条件(车辆+时间+阈值+预测天数)后继续。")
+        return
 
     _vehicle = ins_cfg["vehicle_id"]
     _start = ins_cfg["start_time"]
@@ -1349,7 +1338,6 @@ with tab_insul:
     _forecast = ins_cfg["forecast_days"]
     _degree = ins_cfg["poly_degree"]
 
-    # 2. 数据加载(复用侧边栏 fc_data_mode:mock / 真实 / 测试CSV)
     use_mock = fc_data_mode.startswith("模拟")
     use_test_csv = fc_data_mode == "测试异常CSV"
     use_steady_csv = fc_data_mode == "稳态测试CSV(95A)"
@@ -1377,29 +1365,25 @@ with tab_insul:
 
     if raw_insul is None or len(raw_insul) == 0:
         st.warning("所选时间范围内无绝缘数据,请调整范围或切换数据源")
-        st.stop()
+        return
 
-    # 数据无 FC_MainSts 列时自动补默认状态4(运行态),保证 mock/测试CSV 也能演示
     if "FC_MainSts" not in raw_insul.columns:
         raw_insul["FC_MainSts"] = 4
         st.info("ℹ 数据无 FC_MainSts 列,已默认按运行态(4)处理")
 
-    # 3. 清洗 + 按状态×interval分钟聚合最小值
     df_insul = process_insulation_data(raw_insul, interval_minutes=_interval)
 
     if len(df_insul) == 0:
         st.warning("清洗后无有效绝缘数据(检查:绝缘值是否<=0/65535/>=9999,状态是否为4/8)")
-        st.stop()
+        return
 
-    # 有效点数(非NaN的绝缘值)
     n_valid = int(df_insul["FC_VehicleIsolationR"].notna().sum())
     if n_valid < 20:
         st.warning(
             f"数据不足,无法进行趋势预测(至少需要20个有效点,当前{n_valid}个)"
         )
-        st.stop()
+        return
 
-    # 4. 趋势预测(多项式拟合 + 报警线触碰 + 健康度)
     prediction = predict_insulation_trend(
         df_insul,
         alarm_values=[_primary, _secondary],
@@ -1407,10 +1391,8 @@ with tab_insul:
         poly_order=_degree,
     )
 
-    # 5. 统计摘要(5卡片 + 健康度进度条)
     render_insulation_stats(df_insul, prediction)
 
-    # 6. 核心图表(散点+报警线+趋势预测+触碰标注)
     st.markdown("#### 绝缘阻值趋势 + 报警线 + 预测")
     fig_insul = create_insulation_figure(
         df_insul,
@@ -1421,12 +1403,10 @@ with tab_insul:
     )
     st.plotly_chart(fig_insul, use_container_width=True)
 
-    # 7. 状态分布分析(预先计算,供三列扩展面板使用)
     _has_states = ("FC_MainSts" in raw_insul.columns
                    and raw_insul["FC_MainSts"].isin([4, 8]).any())
     state_res = analyze_state_distribution(raw_insul) if _has_states else {}
 
-    # 8. 三列扩展分析
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -1442,14 +1422,13 @@ with tab_insul:
                         f"t检验: p={tt['p_value']:.4f}({_sig}显著) · "
                         f"运行态阻值更低: {tt.get('state4_lower')}"
                     )
-                # 状态统计摘要
-                s4 = state_res.get("state4_stats", {})
-                s8 = state_res.get("state8_stats", {})
-                if s4 and s8:
-                    st.caption(
-                        f"运行态均值 {s4.get('mean', 0):.0f} kΩ · "
-                        f"上电态均值 {s8.get('mean', 0):.0f} kΩ"
-                    )
+                    s4 = state_res.get("state4_stats", {})
+                    s8 = state_res.get("state8_stats", {})
+                    if s4 and s8:
+                        st.caption(
+                            f"运行态均值 {s4.get('mean', 0):.0f} kΩ · "
+                            f"上电态均值 {s8.get('mean', 0):.0f} kΩ"
+                        )
             else:
                 st.info("无状态分布数据(可能只有单状态或无 FC_MainSts)")
 
@@ -1480,8 +1459,6 @@ with tab_insul:
                 "R²>0.8 高置信 / >0.5 中 / <0.5 低(衰减趋势不显著)"
             )
 
-    # 9. 多车绝缘对比(横向对比 + 健康度排名)
-    # 将 data 存入 session_state, 供 insulation.vehicle_comparison._get_data_dict 读取
     st.session_state['data'] = data
     with st.expander("🆚 多车绝缘对比", expanded=False):
         _all_cars = sorted(data.keys()) if data else []
@@ -1506,7 +1483,6 @@ with tab_insul:
                         use_container_width=True,
                         hide_index=True,
                     )
-                    # 各车健康度色标摘要
                     _emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
                     for r in cmp_result:
                         _hs = r.get('health_score', 0)
@@ -1534,3 +1510,43 @@ with tab_insul:
         "© 2026 绝缘阻值统计及预测 · "
         "报警阈值可在筛选栏调整 · 预测基于多项式拟合,置信度取决于数据质量"
     )
+
+
+# ============================================================
+# 顶层 Tab 容器:只做懒加载函数调用 (Streamlit Cloud 冷启动不崩)
+# ============================================================
+
+# tab_overview: 需要 time_range_preset 侧边栏值做过滤
+with tab_overview:
+    _render_tab_overview(cars, data, time_range_preset)
+
+with tab_dur:
+    _render_tab_durability(dur_df)
+
+with tab_bench:
+    _render_tab_bench()
+
+with tab_contacts:
+    _render_tab_contacts()
+
+with tab_cmp:
+    _render_tab_compare(cars, data)
+
+with tab_report:
+    _render_tab_report(cars, data)
+
+with tab_ai:
+    # 作为 AI 上下文默认车
+    _render_tab_ai(sel_car_default=cars[0] if cars else None)
+
+with tab_forecast:
+    _render_tab_forecast(cars, data)
+
+with tab_fc:
+    _render_tab_fc(data, fc_data_mode)
+
+with tab_perf:
+    _render_tab_performance(data, fc_data_mode)
+
+with tab_insul:
+    _render_tab_insulation(data, fc_data_mode)
