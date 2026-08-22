@@ -1167,27 +1167,55 @@ def _render_tab_bench() -> None:
     # session 级幂等:避免 Streamlit 页面 rerun 时同一事件被反复推送
     if "_bench_push_sent_ids" not in st.session_state:
         st.session_state["_bench_push_sent_ids"] = set()
+    session_sent_ids: set[str] = st.session_state["_bench_push_sent_ids"]
+    logger.info(
+        "[台架预警流程] 进入推送流程:命中事件=%d 阈值=离均差>%.0fmV/单体<%.0fmV "
+        "飞书推送=%s session已标记发送=%d条",
+        len(raw_alert_events), _dev_thresh, _avg_thresh,
+        "ON" if _enable_push else "OFF", len(session_sent_ids),
+    )
 
     display_events: list[dict] = []
     if raw_alert_events:
         # 先逐个写库,用 db_save_event 返回的真实 event_id(含 ts YmdHMS),
         # 不自己猜算法,避免和数据库 _make_event_id 对不上
         ev_ids: list[str] = []
-        for ev in raw_alert_events:
+        for ev_idx, ev in enumerate(raw_alert_events, 1):
+            _ev_desc = (
+                f"[{ev_idx}/{len(raw_alert_events)}] "
+                f"cycle={ev.get('cycle_id')} pp={ev.get('power_point',0):.1f}kW "
+                f"{ev.get('condition')} value={ev.get('value',0):.1f}{ev.get('unit','mV')}"
+            )
             try:
+                t_save = time.perf_counter()
                 real_eid = db_save_event(ev)  # INSERT OR IGNORE,天然幂等
+                dt_save_ms = (time.perf_counter() - t_save) * 1000
                 ev_ids.append(real_eid)
+                logger.info(
+                    "[台架预警流程] 步骤1 写alert_events: %s → eid=%s | 耗时=%.0fms",
+                    _ev_desc, (real_eid[:30] + "…") if len(real_eid) > 30 else real_eid,
+                    dt_save_ms,
+                )
             except Exception as e:
-                logger.error("台架预警入库失败 ev=%s err=%s",
-                             f"{ev['cycle_id']}_{ev['power_point']}", e, exc_info=True)
+                logger.error(
+                    "[台架预警流程] 步骤1 写alert_events失败: %s err=%s",
+                    _ev_desc, e, exc_info=True,
+                )
                 ev_ids.append("")  # 失败占位
-        status_map = db_get_event_status_map([e for e in ev_ids if e])
+        valid_ids = [e for e in ev_ids if e]
+        status_map = db_get_event_status_map(valid_ids)
+        logger.info(
+            "[台架预警流程] 步骤1.5 拉取DB状态: 共%d个有效eid,status_map=%s",
+            len(valid_ids), status_map,
+        )
 
         # 哪些事件需要推送:DB里状态 != sent,且 session 级未标记已推送过
         events_to_push: list[tuple[str, dict]] = []
+        skip_reason_stats: dict[str, int] = {"写库失败": 0, "已sent": 0, "session已标记": 0, "推送开关OFF": 0, "待推送": 0}
         for eid, ev in zip(ev_ids, raw_alert_events):
             if not eid:
                 # 写库失败的事件跳过推送,但仍展示给用户
+                skip_reason_stats["写库失败"] += 1
                 display_ev = dict(ev)
                 display_ev["event_id"] = "<写库失败>"
                 display_ev["db_status"] = "failed"
@@ -1196,7 +1224,7 @@ def _render_tab_bench() -> None:
                 display_events.append(display_ev)
                 continue
             db_status = status_map.get(eid, "pending")
-            already_sent_in_session = eid in st.session_state["_bench_push_sent_ids"]
+            already_sent_in_session = eid in session_sent_ids
             needs_push = (
                 _enable_push
                 and not already_sent_in_session
@@ -1204,6 +1232,13 @@ def _render_tab_bench() -> None:
             )
             if needs_push:
                 events_to_push.append((eid, ev))
+                skip_reason_stats["待推送"] += 1
+            elif not _enable_push:
+                skip_reason_stats["推送开关OFF"] += 1
+            elif db_status == "sent":
+                skip_reason_stats["已sent"] += 1
+            elif already_sent_in_session:
+                skip_reason_stats["session已标记"] += 1
             # 准备展示字段(先默认用数据库状态)
             display_ev = dict(ev)
             display_ev["event_id"] = eid
@@ -1217,12 +1252,35 @@ def _render_tab_bench() -> None:
             )
             display_events.append(display_ev)
 
+        # ---------- 打印推送判定汇总日志(判断"为什么没推"最关键的一行) ----------
+        logger.info(
+            "[台架预警流程] 步骤2 推送判定汇总: 命中=%d 写库失败=%d 推送开关OFF=%d "
+            "DB已sent=%d session已标记=%d → 真正进入推送链路=%d条 | 明细=%s",
+            len(raw_alert_events),
+            skip_reason_stats["写库失败"], skip_reason_stats["推送开关OFF"],
+            skip_reason_stats["已sent"], skip_reason_stats["session已标记"],
+            len(events_to_push), str(skip_reason_stats),
+        )
+
         # 真正推送: 统一走 feishu_contacts.send_alert_to_contacts
         if events_to_push:
             from durability.feishu_contacts import send_alert_to_contacts
             # 提前查一次已验证联系人,给用户看数量提示
+            t_vc = time.perf_counter()
             verified_contacts = db_get_verified_contacts()
+            dt_vc_ms = (time.perf_counter() - t_vc) * 1000
             enabled_cnt = sum(1 for c in verified_contacts if c.get("enabled"))
+            verified_names = [
+                f"{str(c.get('name','?'))}({('启用' if c.get('enabled') else '禁用')}"
+                f" verified={bool(c.get('verified'))})"
+                for c in verified_contacts
+            ]
+            logger.info(
+                "[台架预警流程] 步骤3 联系人预览: 已拉取%d人(enabled=%d) | 耗时=%.0fms "
+                "名单=%s | 待推送事件=%d条 rig_id=%s",
+                len(verified_contacts), enabled_cnt, dt_vc_ms,
+                verified_names, len(events_to_push), _rig_id,
+            )
             push_status_placeholder = st.empty()
             push_status_placeholder.warning(
                 f"📨 正在推送 {len(events_to_push)} 条预警给"
@@ -1230,31 +1288,71 @@ def _render_tab_bench() -> None:
                 f"飞书限速 0.5s/人/条,请稍候..."
             )
 
-            for eid, ev in events_to_push:
+            for ev_step, (eid, ev) in enumerate(events_to_push, 1):
+                eid_short = eid[:30] + ("…" if len(eid) > 30 else "")
+                logger.info(
+                    "[台架预警流程] 步骤4 事件[%d/%d]调用飞书推送: eid=%s "
+                    "cycle=%s pp=%.1fkW cond=%s",
+                    ev_step, len(events_to_push), eid_short,
+                    ev.get("cycle_id"), float(ev.get("power_point", 0)),
+                    ev.get("condition"),
+                )
+                t_ev = time.perf_counter()
                 try:
                     push_results = send_alert_to_contacts(ev, rig_id=_rig_id)
                 except Exception as e:
-                    logger.error("台架预警推送异常 eid=%s err=%s", eid, e, exc_info=True)
+                    dt_ev_ms = (time.perf_counter() - t_ev) * 1000
+                    logger.exception(
+                        "[台架预警流程] 步骤4 事件[%d/%d]推送顶层异常(捕获降级为[]): "
+                        "eid=%s 耗时=%.0fms err=%s",
+                        ev_step, len(events_to_push), eid_short, dt_ev_ms, e,
+                    )
                     push_results = []
+                dt_ev_ms = (time.perf_counter() - t_ev) * 1000
+                logger.info(
+                    "[台架预警流程] 步骤4 事件[%d/%d]推送返回: eid=%s 共返回%d条结果 | 耗时=%.0fms",
+                    ev_step, len(events_to_push), eid_short,
+                    len(push_results), dt_ev_ms,
+                )
 
                 # 写推送日志(每个联系人一条)
                 success_count = 0
-                for pr in push_results:
+                t_all_log = time.perf_counter()
+                for pr_idx, pr in enumerate(push_results, 1):
+                    cname = str(pr.get("name", "?"))
+                    ok = bool(pr.get("success", False))
+                    msg_trunc = str(pr.get("message", ""))[:80]
                     try:
+                        t_lp = time.perf_counter()
                         db_log_push(
                             event_id=eid,
                             contact_id=str(pr.get("contact_id", "")),
-                            contact_name=str(pr.get("name", "")),
-                            success=bool(pr.get("success", False)),
+                            contact_name=cname,
+                            success=ok,
                             message=str(pr.get("message", "")),
                         )
-                        if pr.get("success"):
+                        dt_lp_ms = (time.perf_counter() - t_lp) * 1000
+                        logger.info(
+                            "[台架预警流程] 步骤5 写alert_push_log [%d/%d] eid=%s "
+                            "contact=%s success=%s | 耗时=%.0fms | msg=%s",
+                            pr_idx, len(push_results), eid_short, cname,
+                            "✅OK" if ok else "❌FAIL", dt_lp_ms, msg_trunc,
+                        )
+                        if ok:
                             success_count += 1
                     except Exception as e:
                         logger.error(
-                            "台架预警推送日志写入失败 eid=%s contact=%s err=%s",
-                            eid, pr.get("name"), e, exc_info=True,
+                            "[台架预警流程] 步骤5 写alert_push_log失败 [%d/%d] "
+                            "eid=%s contact=%s err=%s",
+                            pr_idx, len(push_results), eid_short, cname, e,
+                            exc_info=True,
                         )
+                dt_all_log_ms = (time.perf_counter() - t_all_log) * 1000
+                logger.info(
+                    "[台架预警流程] 步骤5 推送日志写入完成: 共%d条 | 成功=%d 失败=%d | 总耗时=%.0fms",
+                    len(push_results), success_count,
+                    len(push_results) - success_count, dt_all_log_ms,
+                )
 
                 # 汇总推送状态,写回 alert_events.status
                 total_push = len(push_results)
@@ -1267,11 +1365,19 @@ def _render_tab_bench() -> None:
                 else:
                     new_status = "failed"
                 try:
+                    t_status = time.perf_counter()
                     db_set_event_status(eid, new_status)
+                    dt_status_ms = (time.perf_counter() - t_status) * 1000
+                    logger.info(
+                        "[台架预警流程] 步骤6 状态回写alert_events: eid=%s "
+                        "%s→%s (成功=%d/%d) | 耗时=%.0fms",
+                        eid_short, status_map.get(eid, "pending"),
+                        new_status, success_count, total_push, dt_status_ms,
+                    )
                 except Exception as e:
                     logger.error(
-                        "台架预警状态回写失败 eid=%s -> %s err=%s",
-                        eid, new_status, e, exc_info=True,
+                        "[台架预警流程] 步骤6 状态回写失败 eid=%s -> %s err=%s",
+                        eid_short, new_status, e, exc_info=True,
                     )
 
                 # session 级标记已推送(防止 rerun 再次触发)

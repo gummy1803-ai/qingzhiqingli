@@ -472,6 +472,9 @@ def send_alert_to_contacts(
 ) -> List[Dict]:
     """向已验证的飞书人员推送预警通知(通过 Open API 直接发消息给个人)。
 
+    关键节点全部带结构化日志,便于排查发送失败卡在哪一步:
+      [台架预警发送] 入口 → 联系人过滤 → 逐人发送前 → 发送后 → 结束汇总
+
     Args:
         event: 预警事件 dict
         contacts: 联系人列表; None=自动获取已验证人员
@@ -480,34 +483,150 @@ def send_alert_to_contacts(
     Returns:
         推送结果列表, 每项 {contact_id, name, success, message}
     """
+    t_total = time.perf_counter()
+    ev_short = (
+        f"cycle={event.get('cycle_id','?')} "
+        f"pp={event.get('power_point',0):.1f}kW "
+        f"cond={event.get('condition','?')}"
+    )
+    logger.info("[台架预警发送] ========== 开始 ========== | %s | rig_id=%s", ev_short, rig_id)
+
     if contacts is None:
+        t_fetch = time.perf_counter()
         contacts = get_verified_contacts()
+        dt_fetch_ms = (time.perf_counter() - t_fetch) * 1000
+        logger.info(
+            "[台架预警发送] 步骤1 联系人拉取: DB查询 %d 位已验证联系人 | 耗时=%.0fms",
+            len(contacts), dt_fetch_ms,
+        )
+    else:
+        logger.info(
+            "[台架预警发送] 步骤1 联系人拉取: 调用方已传入 contacts=%d 人(跳过DB拉取)",
+            len(contacts),
+        )
 
     if not contacts:
-        logger.warning("无可推送的已验证飞书人员")
+        logger.warning(
+            "[台架预警发送] ⛔ 提前结束: 0 位已验证联系人 → 请先去「飞书人员对接」Tab"
+            "新增联系人并点「发送测试消息」把 verified 打勾。 | %s", ev_short,
+        )
+        return []
+
+    # 过滤: 必须 enabled=True + open_id 非空 + app_id 非空 + app_secret 非空
+    # (用户可能把某个联系人临时禁用、或者 open_id 没填)
+    valid_contacts: List[Dict] = []
+    invalid_notes: List[str] = []
+    for c in contacts:
+        cid = str(c.get("id", ""))[:10]
+        name = str(c.get("name", "?"))
+        enabled = bool(c.get("enabled", False))
+        oid_ok = bool(c.get("open_id") and str(c.get("open_id", "")).strip())
+        app_ok = bool(c.get("app_id") and str(c.get("app_id", "")).strip())
+        sec_ok = bool(c.get("app_secret") and len(str(c.get("app_secret", ""))) >= 8)
+        if enabled and oid_ok and app_ok and sec_ok:
+            valid_contacts.append(c)
+        else:
+            reasons = []
+            if not enabled:
+                reasons.append("enabled=False")
+            if not oid_ok:
+                reasons.append("open_id空")
+            if not app_ok:
+                reasons.append("app_id空")
+            if not sec_ok:
+                reasons.append("app_secret<8位或空")
+            invalid_notes.append(f"[{cid}] {name}: " + "/".join(reasons))
+    logger.info(
+        "[台架预警发送] 步骤2 联系人有效性过滤: 共%d 位, 有效%d 位, 跳过%d 位",
+        len(contacts), len(valid_contacts), len(invalid_notes),
+    )
+    if invalid_notes:
+        for note in invalid_notes:
+            logger.warning("[台架预警发送] 跳过(配置不合规): %s", note)
+
+    if not valid_contacts:
+        logger.warning("[台架预警发送] ⛔ 提前结束: 0 位有效联系人(全部被跳过)。 | %s", ev_short)
         return []
 
     results: List[Dict] = []
-    for c in contacts:
-        text = _build_alert_text(event, c, rig_id)
+    ok_cnt = 0
+    fail_cnt = 0
+    for idx, c in enumerate(valid_contacts, 1):
+        name = str(c.get("name", "?"))
+        oid = str(c.get("open_id", ""))
+        oid_mask = oid[:8] + "..." if len(oid) > 8 else oid
+        app_id = str(c.get("app_id", ""))
+        app_id_mask = app_id[:8] + "..." if len(app_id) > 8 else app_id
+        sec_len = len(str(c.get("app_secret", "")))
+        logger.info(
+            "[台架预警发送] 步骤3 开始发送 第%d/%d位: 联系人=%s | app_id=%s | "
+            "open_id_mask=%s | app_secret_len=%d | %s",
+            idx, len(valid_contacts), name, app_id_mask, oid_mask, sec_len, ev_short,
+        )
+
+        t_build = time.perf_counter()
+        try:
+            text = _build_alert_text(event, c, rig_id)
+        except Exception as e:
+            logger.exception("[台架预警发送] 步骤3.1 文本构建异常: 联系人=%s err=%r", name, e)
+            results.append({
+                "contact_id": c.get("id", ""), "name": name,
+                "success": False, "message": f"构建文本异常: {e}",
+            })
+            fail_cnt += 1
+            continue
+        dt_build_ms = (time.perf_counter() - t_build) * 1000
+        logger.info(
+            "[台架预警发送] 步骤3.1 文本构建完成: len=%d字符 | 耗时=%.0fms | 联系人=%s",
+            len(text), dt_build_ms, name,
+        )
+
+        t_send = time.perf_counter()
         success, msg = _send_feishu_message(
             c.get("app_id", ""),
             c.get("app_secret", ""),
             c.get("open_id", ""),
             text,
         )
+        dt_send_ms = (time.perf_counter() - t_send) * 1000
         results.append({
             "contact_id": c.get("id", ""),
-            "name": c.get("name", ""),
+            "name": name,
             "success": success,
             "message": msg,
         })
 
         if success:
-            _update_last_alert(c.get("id", ""))
+            ok_cnt += 1
+            try:
+                _update_last_alert(c.get("id", ""))
+            except Exception as e:
+                logger.warning(
+                    "[台架预警发送] 步骤3.3 更新 last_alert 失败(不影响发送结果) "
+                    "id=%s err=%s", c.get("id", ""), e,
+                )
+            logger.info(
+                "[台架预警发送] ✅ 第%d/%d位发送成功: %s | 耗时=%.0fms | %s",
+                idx, len(valid_contacts), name, dt_send_ms, ev_short,
+            )
+        else:
+            fail_cnt += 1
+            logger.warning(
+                "[台架预警发送] ❌ 第%d/%d位发送失败: %s | 耗时=%.0fms | 原因=%s | %s",
+                idx, len(valid_contacts), name, dt_send_ms, msg, ev_short,
+            )
 
-        logger.info("推送预警 -> %s: success=%s msg=%s", c.get("name"), success, msg)
-        time.sleep(0.5)  # 飞书限速
+        # 飞书限速 0.5s/人(最后一位不加 sleep 省时间)
+        if idx < len(valid_contacts):
+            time.sleep(0.5)
+
+    dt_total_ms = (time.perf_counter() - t_total) * 1000
+    logger.info(
+        "[台架预警发送] ========== 结束 ========== | %s | rig_id=%s | "
+        "有效联系人=%d位 成功=%d 失败=%d | 总耗时=%.0fms | 平均=%.0fms/人",
+        ev_short, rig_id, len(valid_contacts), ok_cnt, fail_cnt,
+        dt_total_ms, dt_total_ms / max(len(valid_contacts), 1),
+    )
 
     return results
 
