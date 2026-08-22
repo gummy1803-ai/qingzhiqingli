@@ -673,9 +673,11 @@ if _bench_builtin_dir.exists() and use_builtin == "使用内置数据(自动扫�
 
 if _recognized:
     # ---------- 11 个 Tab 的固定顺序与索引(用于引导提示第几个) ----------
-    _TAB_ORDER = ["整车看板", "📈 性能统计预测", "耐久衰减", "🔬 台架耐久统计及预警",
-                  "📡 飞书人员对接", "多车对比", "报告导出", "AI 助手", "趋势预测",
-                  "⚡ 燃电运行看板", "🔌 绝缘阻值统计"]
+    # 顺序必须与 st.tabs(...) 完全一致:前4=企业核心功能,后7=补充功能
+    _TAB_ORDER = ["⚡ 燃电运行看板", "📈 性能统计预测", "🔌 绝缘阻值统计",
+                  "🔬 台架耐久统计及预警",
+                  "整车看板", "耐久衰减", "趋势预测", "多车对比", "报告导出",
+                  "AI 助手", "📡 飞书人员对接"]
 
     _jump_card = st.container(border=True)
     with _jump_card:
@@ -718,10 +720,24 @@ if _recognized:
                     st.snow()
 
 
-# ---------- 主区域 Tab ----------
-
-tab_overview, tab_perf, tab_dur, tab_bench, tab_contacts, tab_cmp, tab_report, tab_ai, tab_forecast, tab_fc, tab_insul = st.tabs([
-    "整车看板", "📈 性能统计预测", "耐久衰减", "🔬 台架耐久统计及预警", "📡 飞书人员对接", "多车对比", "报告导出", "AI 助手", "趋势预测", "⚡ 燃电运行看板", "🔌 绝缘阻值统计",
+# ---------- 主区域 Tab（按企业优先级排序） ----------
+# [核心功能区 1-4] 企业需求四大功能
+# [补充功能区 5-11] 原整车看板/耐久衰减/趋势预测等辅助功能
+# 顺序编号用于「一键跳转」按钮的 ASCII 箭头引导提示
+tab_fc, tab_perf, tab_insul, tab_bench, tab_overview, tab_dur, tab_forecast, tab_cmp, tab_report, tab_ai, tab_contacts = st.tabs([
+    # 核心功能区(前4)
+    "⚡ 燃电运行看板",     # 功能1: 燃电关键运行数据显示 (企业需求第1项)
+    "📈 性能统计预测",     # 功能2: 燃电性能统计及预测 (企业需求第2项)
+    "🔌 绝缘阻值统计",     # 功能3: 绝缘阻值统计及预测 (企业需求第3项)
+    "🔬 台架耐久统计及预警",# 功能4: 台架耐久数据统计及预警 (企业需求第4项)
+    # 补充功能区(后7)
+    "整车看板",            # 辅助:整车数据汇总概览
+    "耐久衰减",            # 辅助:耐久工步(docx)衰减分析
+    "趋势预测",            # 辅助:整车历史线性回归预测
+    "多车对比",            # 辅助:多车横向对比
+    "报告导出",            # 系统:报告一键导出
+    "AI 助手",            # 系统:AI 智能解答(全产品)
+    "📡 飞书人员对接",     # 系统:飞书预警联系人配置
 ])
 
 
@@ -1254,43 +1270,64 @@ def _render_tab_report(
 
 @tab_safe_render
 def _render_tab_ai(sel_car_default: str | None = None) -> None:
-    """Tab7: AI 助手。"""
-    st.header("🤖 AI 数据助手")
-    st.caption("不知道某项数据是什么意思?问 AI 助手吧。基于《数据说明书》回答,不编造。")
+    """Tab10: AI 助手(全产品智能解答)。"""
+    st.header("🤖 燃料电池数据分析 AI 助手")
+    st.caption("全产品智能顾问：4 大核心功能操作流程 · 字段含义/单位 · 计算筛选逻辑 · 预警阈值说明 · Tab 导航")
 
+    # ---------- LLM / 说明书状态 ----------
     try:
         from src.ai_assistant import load_llm_config, load_dictionary
         cfg = load_llm_config()
         has_dict = bool(load_dictionary())
-        if cfg and has_dict:
-            st.success(f"已配置 LLM({cfg['model']}),可智能回答")
-        elif has_dict:
-            st.info("未配置 LLM,使用本地检索模式(只返回说明书相关段落)。"
-                    "配置 config/llm_config.ini 可启用智能回答")
-        else:
-            st.warning("说明书 docs/DATA_DICTIONARY.md 不存在,请先创建")
+        status_cols = st.columns(3)
+        with status_cols[0]:
+            if cfg:
+                st.success(f"✅ 云端 LLM 已启用 ({cfg['model']})")
+            else:
+                st.warning("⚠️ 未配置 LLM,已降级为本地检索(仅返回说明书匹配段)")
+        with status_cols[1]:
+            if has_dict:
+                st.success("✅ 数据说明书已加载")
+            else:
+                st.warning("⚠️ 说明书 docs/DATA_DICTIONARY.md 不存在")
+        with status_cols[2]:
+            st.info("💡 4 大核心功能 Tab 已排最前:①燃电运行 ②性能 ③绝缘 ④台架")
     except Exception as e:
         st.error(f"AI 模块加载失败: {e}")
 
     if "ai_messages" not in st.session_state:
         st.session_state.ai_messages = [
             {"role": "assistant",
-             "content": "你好!我是数据助手。可以问我任何关于报告里数字、字段、计算方式的问题,"
-                        "比如:\n- \"压差 mean=7.4 是什么意思?\"\n- \"百公里氢耗怎么算出来的?\"\n"
-                        "- \"345 的氢耗为什么显示 -?\""}
+             "content": "你好!我是产品全功能 AI 顾问,可以回答下列任何问题(示例):\n\n"
+                        "**📌 操作流程类**\n"
+                        "- 想看单体电压随时间变化,应该去哪个 Tab?步骤是什么?\n"
+                        "- 我要分析 95A 稳态点的衰减趋势,怎么设置筛选条件?\n"
+                        "- 上传 .docx 后,耐久工步数据在哪里看?\n\n"
+                        "**📊 数据解读类**\n"
+                        "- 离均差(FC_AvgCellVoltDev)是什么含义?数值大代表什么?\n"
+                        "- 350 kΩ 和 250 kΩ 两条报警线分别代表什么等级?\n"
+                        "- 电压字段单位是 V 还是 mV?为什么数字这么大?\n\n"
+                        "**⚙️ 计算逻辑类**\n"
+                        "- 稳态段是怎么筛选出来的?180秒规则是什么意思?\n"
+                        "- 绝缘的有效值为什么要每10分钟取最小值?哪些值会被过滤?\n"
+                        "- 台架 6 个功率点(33~195kW)具体是哪 6 档?\n\n"
+                        "**🚨 预警说明类**\n"
+                        "- 台架什么情况下会推飞书消息?推给谁?\n"
+                        "- 绝缘阻值触碰 250kΩ 报警线意味着什么?该怎么办?\n"
+                        "- 飞书密钥过期了,怎么在「飞书人员对接」Tab 重新验证?"}
         ]
 
     for msg in st.session_state.ai_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if prompt := st.chat_input("问任何关于数据的问题..."):
+    if prompt := st.chat_input("问任何关于4大功能操作/数据解读/预警说明/Tab导航的问题..."):
         st.session_state.ai_messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("思考中..."):
+            with st.spinner("AI 思考中(结合4大功能手册+说明书)..."):
                 try:
                     from src.ai_assistant import ask
                     ctx = {"当前查看车辆": sel_car_default} if sel_car_default else None
@@ -1302,30 +1339,47 @@ def _render_tab_ai(sel_car_default: str | None = None) -> None:
                     {"role": "assistant", "content": answer})
 
     st.divider()
-    st.subheader("快捷问题")
-    quick_qs = [
-        "压差 mean=7.4 是什么意思?",
-        "百公里氢耗怎么算出来的?",
-        "345 车辆氢耗为什么显示 -?",
-        "最弱通道 Top1 怎么理解?",
-        "电压字段单位是 V 还是 mV?",
-    ]
-    cols = st.columns(len(quick_qs))
-    for i, q in enumerate(quick_qs):
-        if cols[i].button(q, key=f"quick_{i}"):
-            st.session_state.ai_messages.append({"role": "user", "content": q})
-            with st.chat_message("user"):
-                st.markdown(q)
-            with st.chat_message("assistant"):
-                with st.spinner("思考中..."):
-                    try:
-                        from src.ai_assistant import ask
-                        answer = ask(q)
-                    except Exception as e:
-                        answer = f"AI 调用异常: {e}"
-                    st.markdown(answer)
-                    st.session_state.ai_messages.append(
-                        {"role": "assistant", "content": answer})
+    st.subheader("⚡ 快捷问题(按分类点击)")
+    quick_categories = {
+        "🎯 Tab 导航(去哪个)": [
+            "想看单体电压+电流双轴曲线,去哪个 Tab?步骤是什么?",
+            "上传台架 CSV 后,分析结果在第几个 Tab 看?",
+            "我传了个 .docx(耐久工步),应该看哪里?"
+        ],
+        "📊 功能1/2 解读": [
+            "离均差(FC_AvgCellVoltDev)是什么?数值大会有什么影响?",
+            "稳态段怎么算出来的?180秒 规则解释一下",
+            "燃电极化曲线是什么意思?能判断什么?"
+        ],
+        "🔌 功能3 绝缘": [
+            "350 kΩ 和 250 kΩ 两条报警线分别是什么含义?",
+            "绝缘的有效值是怎么从原始数据算出来的?哪些坏值会被过滤?",
+            "绝缘阻值预测触碰报警线多久,是怎么算出来的?"
+        ],
+        "🏭 功能4 台架预警": [
+            "台架耐久的 6 档标准功率点具体是哪 6 个?",
+            "台架触发飞书预警的具体条件是什么?阈值是多少?",
+            "飞书预警推送给哪些人?怎么新增/修改联系人?"
+        ],
+    }
+    for cat, questions in quick_categories.items():
+        st.markdown(f"**{cat}**")
+        cols = st.columns(len(questions))
+        for i, q in enumerate(questions):
+            if cols[i].button(q, key=f"q_{cat}_{i}", use_container_width=True):
+                st.session_state.ai_messages.append({"role": "user", "content": q})
+                with st.chat_message("user"):
+                    st.markdown(q)
+                with st.chat_message("assistant"):
+                    with st.spinner("AI 思考中..."):
+                        try:
+                            from src.ai_assistant import ask
+                            answer = ask(q)
+                        except Exception as e:
+                            answer = f"AI 调用异常: {e}"
+                        st.markdown(answer)
+                        st.session_state.ai_messages.append(
+                            {"role": "assistant", "content": answer})
 
 
 @tab_safe_render
@@ -1873,38 +1927,42 @@ def _render_tab_insulation(
 # ============================================================
 # 顶层 Tab 容器:只做懒加载函数调用 (Streamlit Cloud 冷启动不崩)
 # ============================================================
+# Tab 渲染调用顺序(与 st.tabs(...) 一一对应):
+# [1-4 核心功能区] 企业四大功能优先
+# [5-11 补充功能区] 辅助 + 系统配置
+# ============================================================
 
-# tab_overview: 需要 time_range_preset 侧边栏值做过滤
-with tab_overview:
-    _render_tab_overview(cars, data, time_range_preset)
-
-with tab_dur:
-    _render_tab_durability(dur_df)
-
-with tab_bench:
-    _render_tab_bench()
-
-with tab_contacts:
-    _render_tab_contacts()
-
-with tab_cmp:
-    _render_tab_compare(cars, data)
-
-with tab_report:
-    _render_tab_report(cars, data)
-
-with tab_ai:
-    # 作为 AI 上下文默认车
-    _render_tab_ai(sel_car_default=cars[0] if cars else None)
-
-with tab_forecast:
-    _render_tab_forecast(cars, data)
-
-with tab_fc:
+# ---- 核心功能区(前4) ----
+with tab_fc:                            # [1] 功能1:燃电关键运行数据显示
     _render_tab_fc(data, fc_data_mode)
 
-with tab_perf:
+with tab_perf:                          # [2] 功能2:燃电性能统计及预测
     _render_tab_performance(data, fc_data_mode)
 
-with tab_insul:
+with tab_insul:                         # [3] 功能3:绝缘阻值统计及预测
     _render_tab_insulation(data, fc_data_mode)
+
+with tab_bench:                         # [4] 功能4:台架耐久数据统计及预警
+    _render_tab_bench()
+
+# ---- 补充功能区(后7) ----
+with tab_overview:                      # [5] 整车数据汇总概览(辅助)
+    _render_tab_overview(cars, data, time_range_preset)
+
+with tab_dur:                           # [6] 耐久工步(docx)衰减分析(辅助)
+    _render_tab_durability(dur_df)
+
+with tab_forecast:                      # [7] 整车历史线性回归预测(辅助)
+    _render_tab_forecast(cars, data)
+
+with tab_cmp:                           # [8] 多车横向对比(辅助)
+    _render_tab_compare(cars, data)
+
+with tab_report:                        # [9] 报告一键导出(系统)
+    _render_tab_report(cars, data)
+
+with tab_ai:                            # [10] AI 智能解答(系统,全产品)
+    _render_tab_ai(sel_car_default=cars[0] if cars else None)
+
+with tab_contacts:                      # [11] 飞书预警联系人配置(系统)
+    _render_tab_contacts()
