@@ -110,9 +110,24 @@ def _app_precheck_banner() -> None:
             enabled_cnt = sum(1 for c in contacts if c.get("enabled", True))
             print(f"  总联系人: {len(contacts)} | 启用: {enabled_cnt} | 已验证(飞书推送绿灯): {verified_cnt}")
             # ✅ 自动检测密钥是否过期 (Streamlit Cloud / 本机启动都自动打一次)
-            print("-" * 10 + " 🔑 密钥预检开始 " + "-" * 30)
+            # ⚠️  用线程池强制超时 8 秒 (Cloud 外网到飞书 API 可能慢, 不能卡启动)
+            print("-" * 10 + " 🔑 密钥预检开始 (超时8秒自动跳过) " + "-" * 20)
+            _key_result = None
             try:
-                result = _detect_creds()
+                import concurrent.futures as _fut
+                with _fut.ThreadPoolExecutor(max_workers=1) as _pool:
+                    _future = _pool.submit(_detect_creds)
+                    _key_result = _future.result(timeout=8)
+            except _fut.TimeoutError:
+                print("  ⏱ 密钥预检超时(>8秒,外网到飞书慢) → 已跳过,可进入飞书人员对接Tab手动触发")
+                logger.warning("[Streamlit启动预检·密钥] 超时>8秒自动跳过(Cloud外网到飞书慢)")
+                _key_result = None
+            except Exception as e:
+                print(f"  ⚠ 密钥预检失败(不影响页面主功能): {e}")
+                logger.warning("[Streamlit启动预检·密钥] 失败: %s", e, exc_info=True)
+                _key_result = None
+            if _key_result is not None:
+                result = _key_result
                 summary = result.get("summary", {})
                 age = result.get("checked_seconds_ago", 0)
                 logger.info(
@@ -134,18 +149,15 @@ def _app_precheck_banner() -> None:
                     en = "✅" if c.get("enabled", True) else "🔲"
                     vf = "✅" if c.get("verified") else "🔲"
                     if cid in per:
-                        info = per[cid]
-                        st_line = _creds_text(info.get("status"), info.get("code"))
-                        el_ms = info.get("elapsed_ms", 0)
+                        c_info = per[cid]
+                        st_line = _creds_text(c_info.get("status"), c_info.get("code"))
+                        el_ms = c_info.get("elapsed_ms", 0)
                         oid = c.get("open_id", "") or ""
                         oid_m = oid[:10] + "..." if len(oid) > 10 else oid
                         print(f"    · {name:<10} 启用={en} 验证={vf}  {app_id:<14} open_id={oid_m:<16}   {st_line} ({el_ms:.0f}ms)")
                     else:
                         print(f"    · {name:<10} 启用={en} 验证={vf}  {app_id:<14}  🔑 N/A (跳过)")
                 print(f"[密钥巡检] ✅ 完成 (总耗时={int(result.get('total_elapsed_ms',0))}ms, cache_age={age:.1f}s)")
-            except Exception as e:
-                print(f"  ⚠ 密钥预检失败(不影响页面主功能): {e}")
-                logger.warning("[Streamlit启动预检·密钥] 失败: %s", e, exc_info=True)
     except Exception as e:
         logger.warning("[Streamlit启动预检] 飞书模块加载失败, 跳过飞书预检: %s", e, exc_info=True)
         print(f"  ⚠ 飞书模块加载失败(不影响页面主功能): {e}")
