@@ -33,15 +33,18 @@ def create_insulation_figure(
     secondary_alarm: float,
     predict_days: int,
     poly_order: int,
+    raw_df: pd.DataFrame | None = None,
 ) -> go.Figure:
     """绘制绝缘趋势图:实际散点(按状态分色)+ 报警线 + 预测 + 触碰标注。
 
     Args:
-        df_insul: process_insulation_data 输出
+        df_insul: process_insulation_data 输出(聚合后的 10 分钟窗口数据)
         primary_alarm: 主报警线 kΩ
         secondary_alarm: 次报警线 kΩ
         predict_days: 预测天数
         poly_order: 多项式阶数
+        raw_df: 原始整车时序数据(可选,传入后叠加 1Hz 原始散点,按状态 4/8 分色
+                并半透明显示,便于观察聚合值与原始数据的偏差)
 
     Returns:
         plotly Figure
@@ -52,6 +55,37 @@ def create_insulation_figure(
                 primary_alarm, secondary_alarm, predict_days, poly_order)
 
     fig = go.Figure()
+
+    # ---------- 叠加原始散点(非聚合,按状态 4/8 分色,浅色透明底) ----------
+    if raw_df is not None and len(raw_df) > 0:
+        from insulation.data_processor import _SENSOR_FAULT, _OVERFLOW, _VALID_STATES
+        ts_col = 'Timestamp' if 'Timestamp' in raw_df.columns else None
+        v_col = 'FC_VehicleIsolationR'
+        s_col = 'FC_MainSts'
+        if ts_col and v_col in raw_df.columns and s_col in raw_df.columns:
+            rts = pd.to_datetime(raw_df[ts_col], errors='coerce')
+            rv = pd.to_numeric(raw_df[v_col], errors='coerce')
+            rs = pd.to_numeric(raw_df[s_col], errors='coerce')
+            raw_mask = (rv > 0) & (rv != _SENSOR_FAULT) & (rv < _OVERFLOW) \
+                & rv.notna() & rs.isin(_VALID_STATES)
+            rdf = pd.DataFrame({'t': rts[raw_mask], 'v': rv[raw_mask],
+                                's': rs[raw_mask]}).dropna(subset=['t'])
+            logger.info("叠加原始散点(清洗后): %d 点(全原始行数=%d)",
+                        len(rdf), len(raw_df))
+            for st, nm, col, sz, op in [
+                (4, '原始-运行态(4)', _STATE4_COLOR, 3, 0.25),
+                (8, '原始-上电态(8)', _STATE8_COLOR, 3, 0.25),
+            ]:
+                sub = rdf[rdf['s'] == st]
+                if len(sub):
+                    fig.add_trace(go.Scatter(
+                        x=sub['t'], y=sub['v'], mode='markers', name=nm,
+                        marker=dict(color=col, size=sz, opacity=op,
+                                    line=dict(width=0)),
+                        legendgroup=f'raw{st}',
+                        hovertemplate='原始时间: %{x}<br>阻值: %{y:.1f} kΩ'
+                                      f'<extra>{nm}</extra>',
+                    ))
 
     # 边界:空数据
     if df_insul is None or len(df_insul) == 0:
@@ -64,9 +98,9 @@ def create_insulation_figure(
         )
         return fig
 
-    # 有效点
+    # 有效点(聚合后的 10 分钟 min 值)
     work = df_insul.dropna(subset=['FC_VehicleIsolationR']).copy()
-    if len(work) == 0:
+    if len(work) == 0 and len(fig.data) == 0:
         logger.warning("无有效绝缘点(全 NaN), 返回空状态图")
         fig.update_layout(
             annotations=[dict(text="无有效绝缘数据", xref="paper", yref="paper",
@@ -76,7 +110,7 @@ def create_insulation_figure(
         )
         return fig
 
-    # 实际散点(按状态分色)
+    # 聚合散点(按状态分色,更粗更不透明,叠在原始散点上方)
     if 'FC_MainSts' in work.columns:
         s4 = work[work['FC_MainSts'] == 4]
         s8 = work[work['FC_MainSts'] == 8]
@@ -85,18 +119,24 @@ def create_insulation_figure(
     if len(s4):
         fig.add_trace(go.Scatter(
             x=s4['timestamp'], y=s4['FC_VehicleIsolationR'],
-            mode='markers', name='运行态(4)',
-            marker=dict(color=_STATE4_COLOR, size=6, opacity=0.7),
-            hovertemplate='时间: %{x}<br>阻值: %{y:.1f} kΩ<extra>运行态</extra>',
+            mode='markers', name='聚合-运行态(4)',
+            marker=dict(color=_STATE4_COLOR, size=8, opacity=0.92,
+                        line=dict(width=1, color='rgba(255,255,255,0.5)')),
+            legendgroup='agg4',
+            hovertemplate='窗口: %{x}<br>最小阻值: %{y:.1f} kΩ'
+                          '<extra>聚合-运行态(10min min)</extra>',
         ))
     if len(s8):
         fig.add_trace(go.Scatter(
             x=s8['timestamp'], y=s8['FC_VehicleIsolationR'],
-            mode='markers', name='上电态(8)',
-            marker=dict(color=_STATE8_COLOR, size=6, opacity=0.7),
-            hovertemplate='时间: %{x}<br>阻值: %{y:.1f} kΩ<extra>上电态</extra>',
+            mode='markers', name='聚合-上电态(8)',
+            marker=dict(color=_STATE8_COLOR, size=8, opacity=0.92,
+                        line=dict(width=1, color='rgba(255,255,255,0.5)')),
+            legendgroup='agg8',
+            hovertemplate='窗口: %{x}<br>最小阻值: %{y:.1f} kΩ'
+                          '<extra>聚合-上电态(10min min)</extra>',
         ))
-    logger.info("散点: 运行态 %d 点, 上电态 %d 点", len(s4), len(s8))
+    logger.info("聚合散点: 运行态 %d 点, 上电态 %d 点", len(s4), len(s8))
 
     # 趋势预测(内部调用 predict_insulation_trend)
     prediction = predict_insulation_trend(

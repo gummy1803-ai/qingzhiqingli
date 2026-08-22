@@ -36,6 +36,12 @@ data/
 # ===== 企业原始资料包(整车 CSV / docx / PDF 体积大且敏感, 不允许入库) =====
 企业资料包*/
 
+# ===== 临时脚本与模拟数据(仅本地调试, 不入库) =====
+_selfcheck_*.py
+mock_*.csv
+mock_*.xlsx
+mock_*.docx
+
 # ===== IDE/编辑器 =====
 .vscode/
 .idea/

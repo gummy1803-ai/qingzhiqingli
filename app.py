@@ -1019,9 +1019,11 @@ def _render_tab_bench() -> None:
     from components.durability_chart import render_durability_chart
     from components.durability_alert_log import render_alert_log
 
+    # 企业需求: 补 LFR(低频阻抗) / HFR(高频阻抗) 两个阻抗字段聚合
     _SIGNAL_COLS = [
-        'FC_AvgCellVoltage', 'FC_NetPwrOut', 'FC_CurrOut',
-        'FC_AvgCellVoltDev',
+        'FC_AvgCellVoltage', 'FC_AvgCellVoltDev',
+        'FC_LFR', 'FC_HFR',            # 两个阻抗字段(如缺失会自动跳过)
+        'FC_NetPwrOut', 'FC_CurrOut',
     ]
 
     # ---------- ① 内置目录 CSV(走缓存,按文件 mtime 失效) ----------
@@ -1081,9 +1083,15 @@ def _render_tab_bench() -> None:
 
     filter_opts = render_durability_filter()
 
+    # 信号筛选(企业需求:signal_columns 多选) → 视图 1/2 用用户选的信号,视图 3 固定 4 图
+    user_signals = filter_opts.get('signal_columns') or _SIGNAL_COLS
+    # 功率筛选(selected_powers 已从 render_durability_filter 返回 power_points)
+    sel_powers = (filter_opts.get('power_points')
+                  or filter_opts.get('selected_powers')
+                  or [])
     render_durability_chart(
-        agg_df, _SIGNAL_COLS,
-        filter_opts.get('selected_powers', []),
+        agg_df, user_signals,      # 功率筛选 + 信号筛选 均从筛选栏返回
+        sel_powers,
         filter_opts.get('agg_method', 'mean'),
     )
 
@@ -1922,9 +1930,19 @@ def _render_tab_performance(
         )
         return
 
-    _perf_sigs = ["FC_VoltOut", "FC_AvgCellVoltage",
-                  "FC_NetPwrOut", "FC_MinCellVoltage"]
-    agg_df = aggregate_segments(all_segs, _perf_sigs, exclude_anomaly=False)
+    # ---------- 动态信号聚合:Y 轴信号为主 + 辅助信号(电流/电压/功率/最低电压) ----------
+    _base = ["FC_VoltOut", "FC_NetPwrOut", "FC_MinCellVoltage"]
+    if perf_cfg["y_signal"] not in _base:
+        _perf_sigs = [perf_cfg["y_signal"]] + _base
+    else:
+        _perf_sigs = list(dict.fromkeys([perf_cfg["y_signal"]] + _base))
+    # 企业需求: 离均差 + 方差 两个信号同时出现在信号列表里(便于后续切换也能立刻显示)
+    for ext in ("FC_AvgCellVoltDev", "FC_VARVoltage"):
+        if ext not in _perf_sigs:
+            _perf_sigs.append(ext)
+    agg_df = aggregate_segments(
+        all_segs, _perf_sigs, exclude_anomaly=False,
+        warmup_seconds=perf_cfg["warmup_seconds"])
 
     if len(agg_df) == 0 or "duration" not in agg_df.columns:
         st.warning("聚合后无有效段(可能全部含异常被剔除)")
@@ -1933,19 +1951,42 @@ def _render_tab_performance(
     total_dur_h = float(agg_df["duration"].sum()) / 3600.0
     range_sec = max((pd.Timestamp(end_dt) - pd.Timestamp(start_dt)).total_seconds(), 1)
     coverage = min(float(agg_df["duration"].sum()) / range_sec * 100, 100.0)
-    c1, c2, c3, c4 = st.columns(4)
+    warmup_total = float(agg_df.get("warmup_dropped", pd.Series([0])).sum()) \
+        if "warmup_dropped" in agg_df.columns else 0.0
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("📊 有效数据段", f"{len(agg_df)} 个")
     c2.metric("⏱️ 总有效时长", f"{total_dur_h:.2f} 小时")
     c3.metric("📈 数据覆盖率", f"{coverage:.1f}%")
     c4.metric("⚡ 电流点覆盖", f"{len(current_points)} 个")
+    c5.metric("🔥 丢弃过渡热机", f"{warmup_total:.0f} s")
 
-    st.success(f"分析完成!共找到 {len(all_segs)} 个有效数据段")
+    st.success(
+        f"分析完成!共找到 {len(all_segs)} 个有效数据段 "
+        f"(稳态丢弃前 {perf_cfg['warmup_seconds']}s 过渡热机期)"
+    )
 
-    st.markdown("#### 性能趋势(按电流分组,含多项式趋势线)")
+    # ---------- 性能趋势图: Y 轴信号 + X 轴模式 + 多项式阶数 全部动态接入 ----------
+    y_col_full = f'{perf_cfg["y_signal"]}_mean'
+    x_map_label = {"run_time": "⏱ 累计运行时间 (h)", "datetime": "📅 实际日期"}
+    st.markdown(
+        f"#### 性能趋势 · 「{perf_cfg['y_label']}」 vs 「{x_map_label.get(perf_cfg['x_mode'], perf_cfg['x_mode'])}」"
+        f" · 趋势线 {perf_cfg['poly_degree']}阶"
+    )
+    y_axis_label = f"{perf_cfg['y_label']} ({perf_cfg['y_unit']})"
+    if y_col_full not in agg_df.columns:
+        st.error(
+            f"聚合结果中缺失列 `{y_col_full}` (当前 Y 轴信号={perf_cfg['y_signal']})。"
+            f"可用列: {[c for c in agg_df.columns if c.endswith('_mean')]}"
+        )
+        return
     fig_perf = create_performance_figure(
-        agg_df, x_col="run_time_at_mid", y_col="FC_AvgCellVoltage_mean",
-        group_col="current_target", degree=2, show_trend=True,
-        y_label="平均单体电压 (V)",
+        agg_df,
+        x_col=perf_cfg["x_mode"],   # 'run_time' -> run_time_at_mid / 'datetime' -> mid_time
+        y_col=y_col_full,
+        group_col="current_target",
+        degree=perf_cfg["poly_degree"],
+        show_trend=True,
+        y_label=y_axis_label,
     )
     st.plotly_chart(fig_perf, use_container_width=True)
 
@@ -2082,6 +2123,39 @@ def _render_tab_insulation(
         return
 
     n_valid = int(df_insul["FC_VehicleIsolationR"].notna().sum())
+
+    # ---------- 坏值清洗摘要卡片(企业需求 65535/≥9999 坏值追踪) ----------
+    clean_stats: dict = df_insul.attrs.get('clean_stats', {}) \
+        if hasattr(df_insul, 'attrs') else {}
+    raw_rows = int(clean_stats.get('raw_rows', len(raw_insul) if raw_insul is not None else 0))
+    bad_65535 = int(clean_stats.get('bad_65535', 0))
+    bad_ge9999 = int(clean_stats.get('bad_ge9999', 0))
+    bad_le0 = int(clean_stats.get('bad_le0', 0))
+    bad_state = int(clean_stats.get('bad_state', 0))
+    kept_rows = int(clean_stats.get('kept_rows',
+                                    (len(raw_insul) if raw_insul is not None else 0)
+                                    - bad_65535 - bad_ge9999 - bad_le0 - bad_state))
+    _bc1, _bc2, _bc3, _bc4, _bc5, _bc6 = st.columns(6)
+    _bc1.metric("📥 原始总行数", f"{raw_rows:,}")
+    _bc2.metric("✅ 保留有效行", f"{kept_rows:,}",
+                delta=f"{kept_rows/raw_rows*100:.1f}%" if raw_rows else None)
+    _bc3.metric("❌ ==65535 传感器故障", f"{bad_65535:,}",
+                delta_color="inverse" if bad_65535 else "off")
+    _bc4.metric("⚠️ ≥9999 溢出坏值", f"{bad_ge9999:,}",
+                delta_color="inverse" if bad_ge9999 else "off")
+    _bc5.metric("🔻 ≤0 或 NaN", f"{bad_le0:,}",
+                delta_color="inverse" if bad_le0 else "off")
+    _bc6.metric("🚫 非4/8状态行", f"{bad_state:,}",
+                delta_color="inverse" if bad_state else "off")
+    with st.expander("🧹 坏值清洗规则说明", expanded=False):
+        st.markdown(
+            "- `FC_VehicleIsolationR == 65535` → **传感器故障默认值**,直接剔除\n"
+            "- `FC_VehicleIsolationR ≥ 9999` → **AD 采样溢出**,直接剔除\n"
+            "- `FC_VehicleIsolationR ≤ 0` 或 `NaN` → **无效值**,直接剔除\n"
+            "- `FC_MainSts ∉ {4, 8}` → **非运行/上电状态**,直接剔除\n"
+            "- 清洗后剩余数据按 10 分钟窗口×状态(4/8)取最小绝缘值供趋势分析"
+        )
+
     if n_valid < 20:
         st.warning(
             f"数据不足,无法进行趋势预测(至少需要20个有效点,当前{n_valid}个)"
@@ -2097,13 +2171,15 @@ def _render_tab_insulation(
 
     render_insulation_stats(df_insul, prediction)
 
-    st.markdown("#### 绝缘阻值趋势 + 报警线 + 预测")
+    # ---------- 叠加原始散点(raw_df) + 坏值摘要 ----------
+    st.markdown("#### 绝缘阻值趋势(原始散点按状态4/8分色 + 10min聚合 + 报警线 + 预测)")
     fig_insul = create_insulation_figure(
         df_insul,
         primary_alarm=_primary,
         secondary_alarm=_secondary,
         predict_days=_forecast,
         poly_order=_degree,
+        raw_df=raw_insul,   # 企业需求: 叠加非聚合原始散点,按状态4/8分色透明显示
     )
     st.plotly_chart(fig_insul, use_container_width=True)
 

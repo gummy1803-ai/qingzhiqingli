@@ -43,6 +43,7 @@ def aggregate_segments(
     segments: List[Dict],
     signal_columns: List[str],
     exclude_anomaly: bool = True,
+    warmup_seconds: int = 180,
 ) -> pd.DataFrame:
     """对有效数据段计算各信号统计量。
 
@@ -51,20 +52,24 @@ def aggregate_segments(
                   {start_idx, end_idx, duration, mean_current, segment_data}
         signal_columns: 需统计的信号列名,如 ['FC_AvgCellVoltage','FC_NetPwrOut']
         exclude_anomaly: True 则剔除含异常点(detect_anomalies 标记)的段
+        warmup_seconds: 稳态段前 N 秒作为过渡热机期丢弃,仅用 N 秒之后的数据求统计
+                       (企业要求 180s; 若段总时长 < warmup 则仍保留该段,使用全部数据,
+                       并在日志里 WARNING)
 
     Returns:
         DataFrame,每行一个有效段,列:
         - segment_id: 段编号(对应原 segments 列表索引,剔除后跳号可追溯)
-        - start_time / end_time / mid_time: 起止/中点时间
-        - duration: 持续秒数
-        - current_avg: 平均电流
+        - start_time / end_time / mid_time: 起止/中点时间(基于 warmup 后部分)
+        - duration: 持续秒数(基于 warmup 后部分)
+        - current_avg: 平均电流(基于 warmup 后部分)
+        - warmup_dropped: 丢弃的热机时长(秒,实际丢弃量;若段过短为 0)
         - run_time_at_mid: 段中点对应的累计运行时间(FC_RunTime_Hours)
         - is_anomaly_segment: 该段是否含异常点
         - anomaly_count: 段内异常点数
         - <signal>_mean / <signal>_std / <signal>_cv: 各信号均值/标准差/变异系数
     """
-    logger.info("聚合开始: segments=%d signals=%s exclude_anomaly=%s",
-                len(segments), signal_columns, exclude_anomaly)
+    logger.info("聚合开始: segments=%d signals=%s exclude_anomaly=%s warmup=%ds",
+                len(segments), signal_columns, exclude_anomaly, warmup_seconds)
 
     if not segments:
         logger.warning("无有效段,返回空 DataFrame")
@@ -73,14 +78,49 @@ def aggregate_segments(
     rows: List[Dict] = []
     skipped = 0
     for i, seg in enumerate(segments):
-        sdf = seg['segment_data']
+        sdf = seg.get('segment_data')
         if sdf is None or len(sdf) == 0:
             logger.warning("段%d 数据为空,跳过", i)
             continue
 
-        # ---------- 异常段检测 ----------
-        sdf = _ensure_anomaly_flag(sdf)
-        anom_cnt = int(sdf['is_anomaly'].sum()) if 'is_anomaly' in sdf.columns else 0
+        # ---------- 丢弃稳态段前 warmup_seconds 热机过渡期 ----------
+        ts_warmup = (pd.to_datetime(sdf[_TIMESTAMP_COL], errors='coerce')
+                     if _TIMESTAMP_COL in sdf.columns else None)
+        if warmup_seconds > 0:
+            if ts_warmup is not None and ts_warmup.notna().sum() >= 2:
+                elapsed = (ts_warmup - ts_warmup.iloc[0]).dt.total_seconds()
+                mask_after = (elapsed >= warmup_seconds)
+                drop_n = int((~mask_after).sum())
+                actual_drop_s = (ts_warmup.iloc[min(drop_n, len(sdf)-1)] - ts_warmup.iloc[0]).total_seconds() \
+                    if drop_n < len(sdf) else (ts_warmup.iloc[-1] - ts_warmup.iloc[0]).total_seconds() if len(ts_warmup) >= 2 else 0
+                sdf_warm = sdf.loc[mask_after].copy() if mask_after.any() else sdf.copy()
+                warmup_dropped_s = float(actual_drop_s) if mask_after.any() else 0.0
+            else:
+                # 无时间戳 -> 按索引近似(1 点≈1 秒),截断前 warmup_seconds 行
+                if len(sdf) > warmup_seconds:
+                    sdf_warm = sdf.iloc[warmup_seconds:].copy()
+                    warmup_dropped_s = float(warmup_seconds)
+                else:
+                    sdf_warm = sdf.copy()
+                    warmup_dropped_s = 0.0
+            if len(sdf_warm) < max(3, len(sdf) // 4):
+                logger.warning(
+                    "段%d warmup=%ds 截断后仅剩 %d 行(原 %d),跳过该段",
+                    i, warmup_seconds, len(sdf_warm), len(sdf))
+                skipped += 1
+                continue
+            if 0 < warmup_dropped_s < warmup_seconds * 0.6:
+                logger.warning(
+                    "段%d 总时长不足 warmup(%ds),实际仅丢弃 %.0fs(段过短,未丢弃)",
+                    i, warmup_seconds, warmup_dropped_s)
+                warmup_dropped_s = 0.0
+        else:
+            sdf_warm = sdf.copy()
+            warmup_dropped_s = 0.0
+
+        # ---------- 异常段检测(基于 warmup 后子段) ----------
+        sdf_warm = _ensure_anomaly_flag(sdf_warm)
+        anom_cnt = int(sdf_warm['is_anomaly'].sum()) if 'is_anomaly' in sdf_warm.columns else 0
         has_anomaly = anom_cnt > 0
 
         if exclude_anomaly and has_anomaly:
@@ -89,17 +129,26 @@ def aggregate_segments(
             skipped += 1
             continue
 
-        # ---------- 时间与运行时间定位 ----------
-        ts = (sdf[_TIMESTAMP_COL] if _TIMESTAMP_COL in sdf.columns
+        # ---------- 时间与运行时间定位(warmup 后子段) ----------
+        ts = (sdf_warm[_TIMESTAMP_COL] if _TIMESTAMP_COL in sdf_warm.columns
               else None)
-        mid = len(sdf) // 2
+        mid = len(sdf_warm) // 2
         start_time = ts.iloc[0] if ts is not None else None
         end_time = ts.iloc[-1] if ts is not None else None
         mid_time = ts.iloc[mid] if ts is not None else None
 
+        # duration / mean_current: 用 warmup 后子段重新算,更准确
+        if ts is not None and len(ts.dropna()) >= 2:
+            sub_dur = float((ts.dropna().iloc[-1] - ts.dropna().iloc[0]).total_seconds())
+        else:
+            sub_dur = float(len(sdf_warm))
+        cur_col_local = 'FC_CurrOut' if 'FC_CurrOut' in sdf_warm.columns else None
+        sub_cur_avg = (float(pd.to_numeric(sdf_warm[cur_col_local], errors='coerce').mean())
+                       if cur_col_local is not None else seg.get('mean_current'))
+
         run_time_mid: Optional[float] = None
-        if _RUNTIME_COL in sdf.columns:
-            rt = pd.to_numeric(sdf[_RUNTIME_COL], errors='coerce')
+        if _RUNTIME_COL in sdf_warm.columns:
+            rt = pd.to_numeric(sdf_warm[_RUNTIME_COL], errors='coerce')
             run_time_mid = (float(rt.iloc[mid])
                             if not pd.isna(rt.iloc[mid]) else None)
 
@@ -109,8 +158,9 @@ def aggregate_segments(
             'start_time': start_time,
             'end_time': end_time,
             'mid_time': mid_time,
-            'duration': seg.get('duration', 0),
-            'current_avg': seg.get('mean_current'),
+            'duration': int(round(sub_dur)),
+            'current_avg': round(sub_cur_avg, 4) if sub_cur_avg is not None else seg.get('mean_current'),
+            'warmup_dropped_s': round(warmup_dropped_s, 1),
             'run_time_at_mid': (round(run_time_mid, 4)
                                 if run_time_mid is not None else None),
             'is_anomaly_segment': has_anomaly,
@@ -119,8 +169,8 @@ def aggregate_segments(
 
         # ---------- 各信号统计:mean/std/cv ----------
         for col in signal_columns:
-            if col in sdf.columns:
-                s = pd.to_numeric(sdf[col], errors='coerce').dropna()
+            if col in sdf_warm.columns:
+                s = pd.to_numeric(sdf_warm[col], errors='coerce').dropna()
                 if len(s):
                     m = float(s.mean())
                     sd = float(s.std()) if len(s) > 1 else 0.0
@@ -133,19 +183,34 @@ def aggregate_segments(
                     row[f'{col}_std'] = None
                     row[f'{col}_cv'] = None
             else:
-                logger.warning("段%d 缺少信号列 %s,该列置空", i, col)
-                row[f'{col}_mean'] = None
-                row[f'{col}_std'] = None
-                row[f'{col}_cv'] = None
+                # 兼容: 若 col == 'FC_VARVoltage'(方差) 但原信号里没有,就就地从
+                # FC_AvgCellVoltage 的段内方差(=std^2) 近似生成
+                if col == 'FC_VARVoltage' and 'FC_AvgCellVoltage' in sdf_warm.columns:
+                    s_v = pd.to_numeric(sdf_warm['FC_AvgCellVoltage'], errors='coerce').dropna()
+                    if len(s_v) > 1:
+                        var_v = float(s_v.var(ddof=1))  # 样本方差
+                        row[f'{col}_mean'] = round(var_v, 6)
+                        row[f'{col}_std'] = round(s_v.std(), 6)
+                        row[f'{col}_cv'] = round((s_v.std() / float(s_v.mean())), 6) if float(s_v.mean()) != 0 else None
+                    else:
+                        row[f'{col}_mean'] = None
+                        row[f'{col}_std'] = None
+                        row[f'{col}_cv'] = None
+                else:
+                    logger.warning("段%d 缺少信号列 %s,该列置空", i, col)
+                    row[f'{col}_mean'] = None
+                    row[f'{col}_std'] = None
+                    row[f'{col}_cv'] = None
 
         rows.append(row)
-        logger.info("段%d 聚合完成: dur=%ds cur_avg=%.2fA anomaly=%s(%d) rt_mid=%s",
-                    i, seg.get('duration', 0), seg.get('mean_current', 0),
+        logger.info("段%d 聚合完成: dur=%ds cur_avg=%.2fA warmup_drop=%.0fs anomaly=%s(%d) rt_mid=%s",
+                    i, row['duration'], row['current_avg'] if row['current_avg'] is not None else 0,
+                    warmup_dropped_s,
                     has_anomaly, anom_cnt, run_time_mid)
 
     df_out = pd.DataFrame(rows)
-    logger.info("聚合完成: 输出 %d 段(剔除 %d 段),列数=%d",
-                len(df_out), skipped, len(df_out.columns))
+    logger.info("聚合完成: 输出 %d 段(剔除 %d 段),列数=%d, warmup默认=%ds",
+                len(df_out), skipped, len(df_out.columns), warmup_seconds)
     return df_out
 
 

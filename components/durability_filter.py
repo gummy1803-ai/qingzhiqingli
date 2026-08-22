@@ -28,12 +28,31 @@ logger = logging.getLogger(__name__)
 _RIGS = ['台架A', '台架B', '台架C']
 _DEFAULT_POWER_POINTS: List[float] = [33.0, 58.5, 117.0, 156.0, 175.5, 195.0]
 
-# 信号选项与默认(默认前两个)
+# 信号选项与默认(默认前两个):企业要求补 LFR/HFR 两个阻抗信号
 _SIGNAL_OPTIONS = [
     'FC_AvgCellVoltage', 'FC_AvgCellVoltDev',
+    'FC_LFR', 'FC_HFR',                  # 低频阻抗 / 高频阻抗(企业新增)
     'FC_VARVoltage', 'FC_NetPwrOut', 'FC_VoltOut',
 ]
 _DEFAULT_SIGNALS = _SIGNAL_OPTIONS[:2]
+
+# 企业视图3 四张子图固定信号(平均电压/离均差/LFR/HFR),用于视图3 默认
+_FOUR_PANEL_SIGNALS: List[str] = [
+    'FC_AvgCellVoltage', 'FC_AvgCellVoltDev',
+    'FC_LFR', 'FC_HFR',
+]
+_FOUR_PANEL_TITLES: dict = {
+    'FC_AvgCellVoltage': '平均单体电压',
+    'FC_AvgCellVoltDev': '单体电压离均差',
+    'FC_LFR':           '低频阻抗 LFR',
+    'FC_HFR':           '高频阻抗 HFR',
+}
+_FOUR_PANEL_UNITS: dict = {
+    'FC_AvgCellVoltage': 'V',
+    'FC_AvgCellVoltDev': 'mV',
+    'FC_LFR':           'mΩ·cm²',
+    'FC_HFR':           'mΩ·cm²',
+}
 
 # 预警条件(条件1 必选,条件2 含 '无' 可禁用)
 _ALERT_CONDITIONS = ['离均差>50mV', '平均单体电压<600mV']
@@ -327,6 +346,7 @@ if __name__ == '__main__':
     assert _MAX_HOURS == 24 * 7
     assert _SIGNAL_OPTIONS == [
         'FC_AvgCellVoltage', 'FC_AvgCellVoltDev',
+        'FC_LFR', 'FC_HFR',
         'FC_VARVoltage', 'FC_NetPwrOut', 'FC_VoltOut',
     ]
     assert _DEFAULT_SIGNALS == ['FC_AvgCellVoltage', 'FC_AvgCellVoltDev']

@@ -33,29 +33,50 @@ def _clean_insulation(df: pd.DataFrame,
     规则:
         1. FC_VehicleIsolationR <= 0 剔除
         2. FC_VehicleIsolationR == 65535(传感器故障) 剔除
-        3. FC_VehicleIsolationR >= 9999(溢出) 剔除
+        3. FC_VehicleIsolationR >= 9999(溢出) 剔除(企业要求的坏值过滤)
         4. FC_MainSts 只保留 4 或 8
+
+    附加: 返回 DataFrame.attrs 记录清洗统计(供上层展示坏值摘要):
+        {'raw_rows', 'kept_rows', 'bad_le0', 'bad_65535', 'bad_ge9999', 'bad_state'}
     """
     n0 = len(df)
+    stats: dict = {'raw_rows': n0, 'kept_rows': 0, 'bad_le0': 0, 'bad_65535': 0,
+                   'bad_ge9999': 0, 'bad_state': 0}
     if value_col not in df.columns or state_col not in df.columns:
         logger.error("清洗: 缺列 %s/%s (现有列: %s)",
                      value_col, state_col, list(df.columns))
-        return df.iloc[0:0]
+        out = df.iloc[0:0].copy()
+        out.attrs.update(stats)
+        return out
 
     v = pd.to_numeric(df[value_col], errors='coerce')
     s = pd.to_numeric(df[state_col], errors='coerce')
 
+    # 细分坏值计数(企业要求: 65535 / >=9999 两类坏值单独追踪)
+    m_le0 = (v <= 0) | v.isna()
+    m_65535 = (v == _SENSOR_FAULT)
+    m_ge9999 = (v >= _OVERFLOW)
+    stats['bad_le0'] = int(m_le0.sum())
+    stats['bad_65535'] = int(m_65535.sum())
+    stats['bad_ge9999'] = int(m_ge9999.sum())
+
     # 规则1-3: 值有效性
-    mask_valid = (v > 0) & (v != _SENSOR_FAULT) & (v < _OVERFLOW) & v.notna()
+    mask_valid = (~m_le0) & (~m_65535) & (~m_ge9999)
     n_invalid = int((~mask_valid).sum())
     # 规则4: 状态有效性
     mask_state = s.isin(_VALID_STATES)
     n_bad_state = int(mask_valid.sum() - (mask_valid & mask_state).sum())
+    stats['bad_state'] = n_bad_state
 
     mask = mask_valid & mask_state
     out = df.loc[mask].copy()
-    logger.info("清洗: 输入 %d 行 -> 保留 %d 行 (剔除无效值 %d, 非状态4/8 %d)",
-                n0, len(out), n_invalid, n_bad_state)
+    stats['kept_rows'] = len(out)
+    out.attrs.update(stats)
+    logger.info(
+        "清洗: 输入 %d 行 -> 保留 %d 行 "
+        "(剔除: <=0/NaN %d, ==65535 %d, >=9999 %d, 非状态4/8 %d)",
+        n0, len(out), stats['bad_le0'], stats['bad_65535'],
+        stats['bad_ge9999'], stats['bad_state'])
     return out
 
 
@@ -81,19 +102,25 @@ def process_insulation_data(
         - FC_VehicleIsolationR: 该窗口该状态的最小绝缘值(无数据记 NaN,不填充)
         - FC_MainSts: 状态(4 或 8)
         - is_running: True=运行态(状态4), False=上电非运行态(状态8)
+        DataFrame.attrs.clean_stats = _clean_insulation 的清洗统计(坏值计数)
     """
     logger.info("绝缘处理: 输入 %d 行, 窗口=%d 分钟", len(df), interval_minutes)
+    default_cols = ['timestamp', value_col, state_col, 'is_running']
     if df is None or len(df) == 0:
         logger.warning("绝缘处理: 输入为空")
-        return pd.DataFrame(columns=['timestamp', value_col, state_col,
-                                     'is_running'])
+        empty = pd.DataFrame(columns=default_cols)
+        empty.attrs['clean_stats'] = {'raw_rows': 0, 'kept_rows': 0,
+            'bad_le0': 0, 'bad_65535': 0, 'bad_ge9999': 0, 'bad_state': 0}
+        return empty
 
     # 1. 清洗
     clean = _clean_insulation(df, value_col, state_col)
+    clean_stats = dict(clean.attrs)
     if len(clean) == 0:
         logger.warning("绝缘处理: 清洗后无有效数据")
-        return pd.DataFrame(columns=['timestamp', value_col, state_col,
-                                     'is_running'])
+        empty = pd.DataFrame(columns=default_cols)
+        empty.attrs['clean_stats'] = clean_stats
+        return empty
 
     # 2. 时间戳转 datetime
     clean = clean.copy()
@@ -130,8 +157,10 @@ def process_insulation_data(
     out['is_running'] = out[state_col] == 4  # 4=运行态 True, 8=False
     out = out[['timestamp', 'FC_VehicleIsolationR', state_col, 'is_running']]
     out = out.sort_values(['timestamp', state_col]).reset_index(drop=True)
-    logger.info("绝缘处理完成: 输出 %d 行 (窗口数=%d)",
-                len(out), len(all_windows))
+    # 透传清洗统计 attrs(坏值计数摘要,供绝缘Tab的指标卡片展示)
+    out.attrs['clean_stats'] = clean_stats
+    logger.info("绝缘处理完成: 输出 %d 行 (窗口数=%d), 清洗统计=%s",
+                len(out), len(all_windows), clean_stats)
     return out
 
 

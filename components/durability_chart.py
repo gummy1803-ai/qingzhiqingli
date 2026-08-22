@@ -183,6 +183,7 @@ def create_durability_figure(
         selected_powers: 选中的功率点(如 [33.0, 58.5, 117.0])
         view_mode: 'cycle_trend'=循环衰减趋势(按功率分面)
                    'power_curve'=功率特性曲线(按循环分面)
+                   'four_panel'=4 张独立子图(平均电压/离均差/LFR/HFR,企业需求)
         agg_method: 聚合方法列后缀(mean/median/min/max)
 
     Returns:
@@ -197,7 +198,7 @@ def create_durability_figure(
         logger.warning("聚合数据为空, 返回占位图")
         return _make_placeholder("暂无聚合数据, 请先在筛选栏选择台架/功率点并加载数据")
 
-    if not signal_cols:
+    if not signal_cols and view_mode != 'four_panel':
         logger.warning("未选择信号列, 返回占位图")
         return _make_placeholder("请至少选择一个展示信号")
 
@@ -207,6 +208,8 @@ def create_durability_figure(
     elif view_mode == 'power_curve':
         return _build_power_curve_view(df_agg, signal_cols,
                                        selected_powers, agg_method)
+    elif view_mode == 'four_panel':
+        return _build_four_panel_view(df_agg, selected_powers, agg_method)
     else:
         logger.error("未知 view_mode: %s, 回退到 cycle_trend", view_mode)
         return _build_cycle_trend_view(df_agg, signal_cols,
@@ -465,6 +468,151 @@ def _build_power_curve_view(
     return _apply_dark_theme(fig)
 
 
+# ---------- 视图3: 4 张独立子图(平均电压 / 离均差 / LFR / HFR) ----------
+
+def _build_four_panel_view(
+    df_agg: pd.DataFrame,
+    selected_powers: List[float],
+    agg_method: str,
+) -> go.Figure:
+    """视图3: 企业需求 4 张独立子图模式。
+
+    2×2 布局, 固定 4 张图:
+        [1,1] 平均单体电压 (FC_AvgCellVoltage)
+        [1,2] 单体电压离均差 (FC_AvgCellVoltDev)
+        [2,1] 低频阻抗 LFR  (FC_LFR)
+        [2,2] 高频阻抗 HFR  (FC_HFR)
+    每张子图:
+        - X=循环编号
+        - 不同功率点分色折线 + 标记点 + 线性趋势线(dash)
+        - Hover 含功率点/数据量/质量标记
+
+    若某个信号数据缺失(列不存在或全 NaN), 该子图显示"无数据"提示, 不影响其他子图。
+
+    功率点筛选(selected_powers) / 信号筛选(signal_cols)均生效。
+    """
+    from components.durability_filter import (
+        _FOUR_PANEL_SIGNALS, _FOUR_PANEL_TITLES, _FOUR_PANEL_UNITS,
+    )
+
+    if 'cycle_id' not in df_agg.columns or 'power_point' not in df_agg.columns:
+        logger.error("聚合数据缺少 cycle_id / power_point 列")
+        return _make_placeholder("聚合数据缺少 cycle_id / power_point 列")
+
+    # ---------- 功率点过滤(与视图1/2 一致: 用 selected_powers) ----------
+    available_powers = sorted(df_agg['power_point'].unique())
+    if selected_powers:
+        powers = [p for p in available_powers
+                  if any(np.isclose(p, sp) for sp in selected_powers)]
+    else:
+        powers = list(available_powers)
+    if not powers:
+        powers = list(available_powers)[:6]
+    df_work = df_agg[df_agg['power_point'].apply(
+        lambda p: any(np.isclose(p, sp) for sp in powers))].copy()
+
+    # ---------- 固定 2×2 布局 ----------
+    n_rows, n_cols = 2, 2
+    subplot_titles = []
+    for sig in _FOUR_PANEL_SIGNALS:
+        unit = _FOUR_PANEL_UNITS.get(sig, '')
+        subplot_titles.append(
+            f"📐 {_FOUR_PANEL_TITLES.get(sig, sig)}"
+            + (f" ({unit})" if unit else "")
+        )
+    fig = make_subplots(
+        rows=n_rows, cols=n_cols,
+        subplot_titles=subplot_titles,
+        vertical_spacing=0.16,
+        horizontal_spacing=0.09,
+    )
+
+    panel_positions = [(1, 1), (1, 2), (2, 1), (2, 2)]
+    n_traces_total = 0
+    missing_panels: list[int] = []
+
+    for panel_idx, signal in enumerate(_FOUR_PANEL_SIGNALS):
+        row, col = panel_positions[panel_idx]
+        col_name = _resolve_signal_column(df_work, signal, agg_method)
+        if col_name is None or col_name not in df_work.columns:
+            logger.warning("视图3: 信号 %s 无对应聚合列, 该子图显示无数据", signal)
+            missing_panels.append(panel_idx)
+            # 画一个占位 annotation
+            fig.add_annotation(
+                xref=f'x{panel_idx+1}' if panel_idx else 'x',
+                yref=f'y{panel_idx+1}' if panel_idx else 'y',
+                text=f"无 {_FOUR_PANEL_TITLES.get(signal, signal)} 数据",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=13, color='#888'),
+            )
+            continue
+
+        # 按功率点遍历(每个功率点一条线+趋势)
+        for pp_idx, power in enumerate(powers):
+            sub = df_work[np.isclose(df_work['power_point'], power)] \
+                .sort_values('cycle_id')
+            if len(sub) == 0:
+                continue
+            x = sub['cycle_id'].to_numpy(dtype=float)
+            y = pd.to_numeric(sub[col_name], errors='coerce').to_numpy(dtype=float)
+            if (~np.isnan(y)).sum() == 0:
+                continue
+            color = _SIGNAL_PALETTE[pp_idx % len(_SIGNAL_PALETTE)]
+            dcounts = (sub['数据量'].to_numpy() if '数据量' in sub.columns
+                       else np.full(len(sub), 0))
+            quals = (sub['质量标记'].to_numpy() if '质量标记' in sub.columns
+                     else np.full(len(sub), '', dtype=object))
+            hover_texts = [
+                _build_hovertext(c, power, signal, yv, dc, q)
+                for c, yv, dc, q in zip(x, y, dcounts, quals)
+            ]
+            glabel = f'{power:.1f} kW'
+            show_legend = (panel_idx == 0)  # 图例只在第一个子图出现一次
+            fig.add_trace(go.Scatter(
+                x=x, y=y, mode='lines+markers', name=glabel,
+                line=dict(color=color, width=2),
+                marker=dict(size=7, color=color,
+                            line=dict(width=1,
+                                      color='rgba(255,255,255,0.4)')),
+                text=hover_texts,
+                hovertemplate='%{text}<extra></extra>',
+                showlegend=show_legend,
+                legendgroup=f'pp_{power:.1f}',
+            ), row=row, col=col)
+            n_traces_total += 1
+
+            # 线性趋势线(虚线, 与功率点同色)
+            x_fit, y_fit = _fit_trend(x, y, degree=1)
+            if x_fit is not None:
+                fig.add_trace(go.Scatter(
+                    x=x_fit, y=y_fit, mode='lines',
+                    name=f'{glabel} 趋势',
+                    line=dict(color=color, width=1.5, dash='dash'),
+                    opacity=_TRENDLINE_OPACITY,
+                    showlegend=False,
+                    hoverinfo='skip',
+                    legendgroup=f'pp_{power:.1f}',
+                ), row=row, col=col)
+
+        # 子图坐标轴标题
+        unit = _FOUR_PANEL_UNITS.get(signal, '')
+        y_title = f"{_FOUR_PANEL_TITLES.get(signal, signal)}" \
+                  + (f" ({unit})" if unit else "")
+        fig.update_xaxes(title_text='循环编号', row=row, col=col)
+        fig.update_yaxes(title_text=y_title, row=row, col=col)
+
+    fig.update_layout(
+        title=dict(
+            text='📐 耐久 4 图面板(平均电压 · 离均差 · LFR · HFR)',
+            font=dict(size=16, color=_FONT_COLOR),
+        ),
+        height=820,
+    )
+    logger.info("视图3 完成: 4 面板(缺列 %d 个), 功率点 %d 个, trace %d 条",
+                len(missing_panels), len(powers), n_traces_total)
+    return _apply_dark_theme(fig)
+
+
 # ---------- Streamlit UI 封装 ----------
 
 def render_durability_chart(
@@ -473,38 +621,57 @@ def render_durability_chart(
     selected_powers: List[float],
     agg_method: str = 'mean',
 ) -> None:
-    """Streamlit UI: 子 Tab 切换两种视图并渲染图表。
+    """Streamlit UI: 子 Tab 切换三种视图并渲染图表。
+
+    新增企业视图3: 4 张独立子图(平均电压/离均差/LFR/HFR),固定展示企业 4 个核心指标,
+    功率筛选(selected_powers)与信号筛选(signal_cols,用于视图1/2)均生效。
 
     Args:
         df_agg: 聚合后的 DataFrame
-        signal_cols: 展示信号列表
+        signal_cols: 展示信号列表(视图1/2 使用;视图3 固定 4 个信号)
         selected_powers: 选中的功率点
         agg_method: 聚合方法(mean/median/min/max)
     """
     import streamlit as st
+    from components.durability_filter import _FOUR_PANEL_SIGNALS
 
     logger.info("渲染耐久图表 UI: signals=%s pps=%s agg=%s",
                 signal_cols, selected_powers, agg_method)
 
-    tab1, tab2 = st.tabs([
+    tab1, tab2, tab3 = st.tabs([
         '📈 循环衰减趋势(按功率分面)',
         '📊 功率特性曲线(按循环分面)',
+        '📐 4 图独立面板(电压/离均差/LFR/HFR) ← 企业模式',
     ])
 
     with tab1:
+        view1_signals = signal_cols or _FOUR_PANEL_SIGNALS[:2]
         fig1 = create_durability_figure(
-            df_agg, signal_cols, selected_powers,
+            df_agg, view1_signals, selected_powers,
             view_mode='cycle_trend', agg_method=agg_method,
         )
         st.plotly_chart(fig1, use_container_width=True, key='durability_chart_cycle_trend',
                         config={'scrollZoom': True, 'displayModeBar': True})
 
     with tab2:
+        view2_signals = signal_cols or _FOUR_PANEL_SIGNALS[:2]
         fig2 = create_durability_figure(
-            df_agg, signal_cols, selected_powers,
+            df_agg, view2_signals, selected_powers,
             view_mode='power_curve', agg_method=agg_method,
         )
         st.plotly_chart(fig2, use_container_width=True, key='durability_chart_power_curve',
+                        config={'scrollZoom': True, 'displayModeBar': True})
+
+    with tab3:
+        st.caption(
+            "📐 **企业模式**:2×2 固定 4 张图,不同功率点分色显示;功率筛选与左侧一致,"
+            "缺失指标(如 CSV 无 LFR/HFR 列)对应子图自动显示「无数据」"
+        )
+        fig3 = create_durability_figure(
+            df_agg, _FOUR_PANEL_SIGNALS, selected_powers,
+            view_mode='four_panel', agg_method=agg_method,
+        )
+        st.plotly_chart(fig3, use_container_width=True, key='durability_chart_four_panel',
                         config={'scrollZoom': True, 'displayModeBar': True})
 
 
