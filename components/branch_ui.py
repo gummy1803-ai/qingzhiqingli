@@ -65,7 +65,7 @@ def render_branch_management_page():
 def _render_branch_list_tab(bm: BranchManager, branches: list, active_branch: str):
     """渲染分支列表标签页。"""
     # 创建新分支
-    with st.expander("➕ 创建新分支", expanded=False):
+    with _collapse_block("➕ 创建新分支", expanded=False, key_hint="create_branch_top"):
         with st.form("create_branch_form"):
             new_branch_name = st.text_input("分支名称", placeholder="例如: feature-branch")
             new_branch_desc = st.text_area("分支描述", placeholder="描述此分支的用途")
@@ -178,7 +178,7 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
         st.caption(f"🔗 DB快照暂不可用（首次导入时自动同步）: {str(_snap_err)[:40]}")
 
     # ------ 文件夹管理面板 ------
-    with st.expander("📂 文件夹管理（新建/删除/重命名）", expanded=True):
+    with _collapse_block("📂 文件夹管理（新建/删除/重命名）", expanded=True, key_hint="folder_mgmt"):
         folders = bm.list_folders(active_branch)
         folder_paths = [""] + [f["path"] for f in folders]
         if folders:
@@ -238,7 +238,7 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
                     st.error(msg)
 
     # ------ 上传文件（支持选目标文件夹） ------
-    with st.expander("📤 上传文件到分支（支持指定文件夹）", expanded=True):
+    with _collapse_block("📤 上传文件到分支（支持指定文件夹）", expanded=True, key_hint="upload_to_branch"):
         folders = bm.list_folders(active_branch)
         folder_options = [("（根目录·直接上传）", "")] + [
             (f"📁 {f['path']} ({f['file_count']}个文件)", f["path"]) for f in folders
@@ -382,7 +382,7 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
                                     if prev.get("dataframe") is not None:
                                         st.dataframe(prev["dataframe"], use_container_width=True, height=300)
                                     if prev.get("text"):
-                                        with st.expander("正文(前200段)", expanded=False):
+                                        with _collapse_block("正文(前200段)", expanded=False, key_hint="inline_preview_body_200"):
                                             st.text(prev["text"])
                                 elif prev.get("kind") == "image":
                                     try:
@@ -530,7 +530,7 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
                             st.markdown("#### 表格内容（取首张表前100行）")
                             st.dataframe(res.get("dataframe"), use_container_width=True, height=400)
                         if res.get("text"):
-                            with st.expander(f"文档正文（前200段）", expanded=False):
+                            with _collapse_block(f"文档正文（前200段）", expanded=False, key_hint="acttab1_docx_body"):
                                 st.text(res.get("text"))
                     elif res.get("kind") == "image":
                         try:
@@ -644,7 +644,7 @@ def _render_detection_tab(bm: BranchManager, active_branch: str):
                       f"浪费空间 {_format_size(result['wasted_space'])}")
             
             if result["duplicates"]:
-                with st.expander(f"📋 重复文件详情 (点击展开)", expanded=True):
+                with _collapse_block(f"📋 重复文件详情 (点击展开)", expanded=True, key_hint="dup_details"):
                     for dup in result["duplicates"]:
                         st.markdown(f"""
                         <div style="
@@ -687,7 +687,7 @@ def _render_detection_tab(bm: BranchManager, active_branch: str):
             else:
                 st.success(f"✅ 所有 {result['total_files']} 个文件校验通过!")
             
-            with st.expander("📊 校验汇总", expanded=False):
+            with _collapse_block("📊 校验汇总", expanded=False, key_hint="validate_summary"):
                 st.markdown(f"""
                 - **文件总数:** {result['total_files']}
                 - **有效文件:** {result['valid_files']} ✅
@@ -733,7 +733,7 @@ def _render_comparison_tab(bm: BranchManager, branches: list, active_branch: str
         col4.metric("完全相同", summary.get("unchanged", 0))
         
         # 详细差异
-        with st.expander("📋 差异详情", expanded=False):
+        with _collapse_block("📋 差异详情", expanded=False, key_hint="compare_diff_details"):
             if comparison["only_in_a"]:
                 st.markdown(f"### 📂 仅在 `{branch_a}` 中的文件")
                 for f in comparison["only_in_a"]:
@@ -797,7 +797,7 @@ def _render_merge_tab(bm: BranchManager, branches: list, active_branch: str):
             st.error(f"❌ 合并失败: {result.get('error', '未知错误')}")
         
         # 显示结果
-        with st.expander("📊 合并详情", expanded=True):
+        with _collapse_block("📊 合并详情", expanded=True, key_hint="merge_details"):
             st.markdown(f"""
             ### 合并结果
             - **成功合并文件:** {result['merged_files']} 个
@@ -815,7 +815,7 @@ def _render_merge_tab(bm: BranchManager, branches: list, active_branch: str):
             if result.get('conflicts'):
                 st.warning("**⚠️ 存在冲突需要解决:**")
                 for i, conflict in enumerate(result['conflicts']):
-                    with st.expander(f"冲突 {i+1}: {conflict['path']}", expanded=False):
+                    with _collapse_block(f"冲突 {i+1}: {conflict['path']}", expanded=False, key_hint=f"merge_conflict_{i}"):
                         st.markdown(f"""
                         - **源分支哈希:** `{conflict['source_hash'][:20]}...`
                         - **目标分支哈希:** `{conflict['target_hash'][:20]}...`
@@ -961,7 +961,7 @@ def render_sidebar_file_structure():
     active = new_sel or active
 
     # ---- 2. 新建文件夹（单行压缩） ----
-    with st.expander("➕ 新建 / 管理文件夹", expanded=False):
+    with _collapse_block("➕ 新建 / 管理文件夹", expanded=False, key_hint="sb_new_mgmt_folder"):
         new_fp = st.text_input("新文件夹路径 (可多级)", key="sb_new_fp",
                                placeholder="例: raw/车212/第一批", label_visibility="collapsed")
         if st.button("✅ 新建文件夹", key="sb_mkdir_btn", use_container_width=True):
@@ -978,7 +978,7 @@ def render_sidebar_file_structure():
         st.caption("重命名/删除文件夹: 请打开「🌿 分支管理」→「📁 文件结构」")
 
     # ---- 3. 上传文件到指定目录 ----
-    with st.expander("📤 上传文件到分支", expanded=True):
+    with _collapse_block("📤 上传文件到分支", expanded=True, key_hint="sb_upload_to_branch"):
         folders = bm.list_folders(active)
         folder_opts = [("（根目录）", "")] + [(f"📁 {f['path']}", f["path"]) for f in folders]
         display_map = {label: value for label, value in folder_opts}
@@ -1068,7 +1068,7 @@ def render_sidebar_file_structure():
                         st.error(prev.get("error") or "预览失败")
                     else:
                         kind = prev.get("kind", "")
-                        with st.expander(f"预览 · {Path(path).name} ({kind.upper()})", expanded=False):
+                        with _collapse_block(f"预览 · {Path(path).name} ({kind.upper()})", expanded=False, key_hint=f"sb_preview_{Path(path).name}_{i}"):
                             if prev.get("dataframe") is not None:
                                 st.dataframe(prev["dataframe"], use_container_width=True, height=220)
                             elif prev.get("kind") == "image":
