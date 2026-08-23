@@ -33,25 +33,33 @@ def render_branch_management_page():
         total_files = sum(b.get("file_count", 0) for b in branches)
         st.metric("文件总数", total_files)
     
-    # 操作面板
-    # NOTE: 原方案使用 st.tabs 嵌套 5 个子Tab，因主Tab本身就是 st.tabs 容器里的一项，
-    # 触发 Streamlit "Tab 内嵌 Tab" 限制，导致 metrics 之后内容全空白（静默崩溃）。
-    # 现改用 5 个 st.expander 分区：①兼容所有Streamlit版本  ②"� 文件结构"默认
-    # expanded=True，用户点主Tab一眼就能看到文件夹管理+每行4个文件操作按钮，无需二次点击子Tab。
-    with st.expander("📋 分支列表（创建/切换/重命名/删除）", expanded=False):
-        _render_branch_list_tab(bm, branches, active_branch)
-    
-    with st.expander("📁 文件结构（文件夹管理/文件预览/重命名/移动/删除）", expanded=True):
-        _render_file_structure_tab(bm, active_branch)
-    
-    with st.expander("🔍 检测与校验（重复检测/完整性校验）", expanded=False):
-        _render_detection_tab(bm, active_branch)
-    
-    with st.expander("🔀 分支对比（文件/指标差异）", expanded=False):
-        _render_comparison_tab(bm, branches, active_branch)
-    
-    with st.expander("📦 合并与冲突（分支合并/冲突解决）", expanded=False):
-        _render_merge_tab(bm, branches, active_branch)
+    # 操作面板（严格避免 Streamlit 嵌套违规：
+    #   ① 不允许 tab 内嵌 tab  → 把原先 5 个子 Tab 改成 5 个独立 section
+    #   ② 不允许 expander 内嵌 expander  → 外层不用 expander，内层按需用 expander
+    #   ③ 文件操作区的二级 st.tabs 统一改成 st.radio + 条件渲染）
+    _sec_title = lambda icon, t, desc="": st.markdown(
+        f"#### {icon} {t}\n" + (f"<span style='color:#8aa;font-size:0.8rem'>{desc}</span>" if desc else ""),
+        unsafe_allow_html=True,
+    )
+
+    _sec_title("📋", "分支列表（创建/切换/重命名/删除）", "新建分支表单、分支卡片切换/改名/删除")
+    _render_branch_list_tab(bm, branches, active_branch)
+    st.markdown("---")
+
+    _sec_title("📁", "文件结构（文件夹管理/文件预览/重命名/移动/删除）", "默认展开，一眼能看到文件和每行 4 个操作按钮")
+    _render_file_structure_tab(bm, active_branch)
+    st.markdown("---")
+
+    _sec_title("🔍", "检测与校验（重复检测/完整性校验）")
+    _render_detection_tab(bm, active_branch)
+    st.markdown("---")
+
+    _sec_title("🔀", "分支对比（文件/指标差异）")
+    _render_comparison_tab(bm, branches, active_branch)
+    st.markdown("---")
+
+    _sec_title("📦", "合并与冲突（分支合并/冲突解决）")
+    _render_merge_tab(bm, branches, active_branch)
 
 
 def _render_branch_list_tab(bm: BranchManager, branches: list, active_branch: str):
@@ -476,21 +484,32 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
                                     else:
                                         st.error(msg)
 
-        st.caption("💡 上面每行 4 个按钮不够用？下方高级面板按 Tab 分类：预览 / 移动 / 重命名 / 删除（批量选择文件）")
+        st.caption("💡 上面每行 4 个按钮不够用？下方高级面板按动作分类：预览 / 移动 / 重命名 / 删除（避免 tab 内嵌 tab 报错，改用分段切换）")
 
         # ===== 动作面板: 预览 / 移动 / 重命名 / 删除 =====
+        # 用 st.radio 代替 st.tabs，避免在主 tab 内再嵌 st.tabs 触发 Streamlit 嵌套违规
         st.markdown("### 🛠️ 文件操作（单文件）")
         path_options = [f["path"] for f in files]
         if not path_options:
             st.info("当前筛选条件下无文件")
             return
 
-        act_tab1, act_tab2, act_tab3, act_tab4 = st.tabs([
-            "👁️ 打开预览", "➡️ 移动位置", "✏️ 重命名", "🗑️ 删除",
-        ])
+        act_mode = st.radio(
+            "选择动作",
+            options=["preview", "move", "rename", "delete"],
+            format_func=lambda v: {
+                "preview": "👁️ 打开预览",
+                "move": "➡️ 移动位置",
+                "rename": "✏️ 重命名",
+                "delete": "🗑️ 删除",
+            }[v],
+            horizontal=True,
+            key="file_action_mode",
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
 
-        # -- Tab A: 预览 --
-        with act_tab1:
+        if act_mode == "preview":
+            # -- 模式 A: 预览 --
             prev_sel = st.selectbox("选择要预览的文件", path_options, key="preview_sel")
             if st.button("👁️ 打开预览", key="do_preview", use_container_width=True):
                 _logger.info("[UI-文件预览] 点击: branch=%s, path=%s", active_branch, prev_sel)
@@ -524,17 +543,15 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
                         with open(res.get("raw_path"), "rb") as fh:
                             st.download_button("⬇️ 下载此二进制文件",
                                                data=fh.read(), file_name=Path(prev_sel).name)
-                    # 也给一个"数据一键跳到上传历史"按钮
                     st.caption("提示: 如果是业务 CSV/DOCX/XLSX，已自动同步到 [📁 上传历史] Tab 查看")
 
-        # -- Tab B: 移动（跨目录） --
-        with act_tab2:
+        elif act_mode == "move":
+            # -- 模式 B: 移动（跨目录） --
             move_src = st.selectbox("选择要移动的文件", path_options, key="move_src_sel")
             move_folder_opts = ["（根目录）"] + [f["path"] for f in folders]
             move_tgt_label = st.selectbox("移动到哪个文件夹？", move_folder_opts, key="move_tgt_folder")
             move_tgt_folder = "" if move_tgt_label == "（根目录）" else move_tgt_label
-            # 目标文件名：默认不变,可改
-            move_new_name = st.text_input("新文件名（不改就留空）",
+            move_new_name = st.text_input("新文件名（不改就留原）",
                                           value=Path(move_src).name, key="move_new_name")
             if Path(move_new_name).name != move_new_name:
                 st.warning("⚠️ 新文件名不能带路径，用上方'移动到哪个文件夹'选择目录")
@@ -553,21 +570,19 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
                     else:
                         st.error(msg)
 
-        # -- Tab C: 重命名文件（已存在·优化版） --
-        with act_tab3:
+        elif act_mode == "rename":
+            # -- 模式 C: 重命名文件（已存在·优化版） --
             file_to_rename = st.selectbox(
                 "选择要重命名的文件",
                 options=path_options,
                 key="file_rename_select_v2",
             )
-            default_ext = Path(file_to_rename).suffix if file_to_rename else ""
             new_name_val = st.text_input(
                 "新名字（含扩展名）",
                 value=Path(file_to_rename).name if file_to_rename else "",
                 key="file_rename_new_name_v2",
-                help="只改文件名（保持同目录）；要换目录请用 '➡️ 移动位置' Tab"
+                help="只改文件名（保持同目录）；要换目录请用 '➡️ 移动位置'"
             )
-            # 拼接成相对路径（保持原目录）
             src_parent = str(Path(file_to_rename).parent).replace("\\", "/") if file_to_rename else ""
             if src_parent == ".":
                 src_parent = ""
@@ -578,7 +593,7 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
                 if not new_name_val or new_name_val.strip() == "":
                     st.error("请输入新文件名")
                 elif Path(new_name_val).name != new_name_val.strip():
-                    st.error("新名字不能包含路径，移动目录请用 '➡️ 移动位置' Tab")
+                    st.error("新名字不能包含路径，移动目录请用 '➡️ 移动位置'")
                 else:
                     _logger.info("[UI-文件重命名] 点击确认: branch=%s, old=%s, new=%s",
                                 active_branch, file_to_rename, combined_rename)
@@ -588,8 +603,8 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
                     else:
                         st.error(msg)
 
-        # -- Tab D: 删除文件（已存在·加二次确认） --
-        with act_tab4:
+        elif act_mode == "delete":
+            # -- 模式 D: 删除文件（已存在·加二次确认） --
             file_to_delete = st.selectbox(
                 "选择要删除的文件",
                 options=path_options,
