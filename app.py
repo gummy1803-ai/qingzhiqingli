@@ -263,12 +263,40 @@ apply_tab_safety_globals()
 
 st.set_page_config(
     page_title="氢质氢离 · 设备测试数据分析与自动报告助手",
-    page_icon="📊",
+    page_icon="⚡",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# 工业科技感暗色主题(全局 CSS 注入,仅需调用一次)
+# 企业级深色科技主题(全局 CSS 注入,仅需调用一次)
 apply_custom_css()
+
+# 顶部标题栏
+_top_html = """
+<div style="
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px 0 20px 0;
+    border-bottom: 1px solid rgba(0,212,255,0.1);
+    margin-bottom: 8px;
+">
+    <div style="
+        width: 44px; height: 44px;
+        background: linear-gradient(135deg, #0096C7, #00D4FF);
+        border-radius: 10px;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 22px; font-weight: 700; color: #0B0E17;
+    ">H2</div>
+    <div>
+        <div style="font-size: 1.25rem; font-weight: 700; color: #00D4FF; letter-spacing: -0.01em;">
+            氢质氢离 · 设备测试数据分析与自动报告助手
+        </div>
+        <div style="font-size: 0.78rem; color: #6B7894; margin-top: 2px;">
+            燃料电池整车数据 / 耐久工步 / 台架循环 · 全流程分析平台
+        </div>
+    </div>
+</div>
+"""
+st.markdown(_top_html, unsafe_allow_html=True)
 
 DATA_ROOT = Path(__file__).parent / "企业资料包02_氢质氢离"
 
@@ -321,8 +349,12 @@ def load_default_durability() -> pd.DataFrame:
 # ---------- 侧边栏 ----------
 
 with st.sidebar:
-    st.title("📊 设备测试分析助手")
-    st.caption("氢质氢离 · 燃料电池整车 + 耐久")
+    st.markdown("""
+    <div style="padding: 8px 0 12px 0; border-bottom: 1px solid rgba(0,212,255,0.1); margin-bottom: 12px;">
+        <div style="font-size: 1.1rem; font-weight: 700; color: #00D4FF;">设备测试分析助手</div>
+        <div style="font-size: 0.72rem; color: #6B7894; margin-top: 2px;">氢质氢离 · 燃料电池全流程</div>
+    </div>
+    """, unsafe_allow_html=True)
 
     st.subheader("数据来源")
     use_builtin = st.radio(
