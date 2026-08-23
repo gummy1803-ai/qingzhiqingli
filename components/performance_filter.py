@@ -25,14 +25,14 @@ _DEFAULT_CURRENT_POINTS = '95±5\n100±5\n150±10'  # 燃电典型工况点
 _DEFAULT_MIN_DURATION = 60  # 默认最短稳态持续 60s(mock 数据波动频繁,180s 过严)
 _DEFAULT_WARMUP_SECONDS = 180  # 企业默认: 稳态段丢弃前 180s 过渡热机期
 
-# Y 轴可选信号 + 对应显示名 + 单位 (企业需求 5 档: 单体电压 / 离均差 / 方差 / 净输出 / 堆电压)
+# Y 轴可选信号 + 对应显示名 + 单位 (与企业 9 字段 SIGNAL_MAP/ai_assistant 口径严格对齐)
 _Y_SIGNAL_OPTIONS: list[dict] = [
-    {'signal': 'FC_AvgCellVoltage',  'label': '平均单体电压',   'unit': 'mV/V', 'col_suffix': '_mean'},
+    {'signal': 'FC_AvgCellVoltage',  'label': '平均单体电压',   'unit': 'mV',   'col_suffix': '_mean'},
     {'signal': 'FC_AvgCellVoltDev',  'label': '单体电压离均差', 'unit': 'mV',   'col_suffix': '_mean'},
     {'signal': 'FC_VARVoltage',      'label': '单体电压方差',   'unit': 'mV²',  'col_suffix': '_mean'},
-    {'signal': 'FC_NetPwrOut',       'label': '净输出功率',     'unit': 'kW',   'col_suffix': '_mean'},
+    {'signal': 'FC_NetPwrOut',       'label': '系统净功率输出', 'unit': 'kW',   'col_suffix': '_mean'},
     {'signal': 'FC_VoltOut',         'label': '电堆输出电压',   'unit': 'V',    'col_suffix': '_mean'},
-    {'signal': 'FC_MinCellVoltage',  'label': '最低单体电压',   'unit': 'mV/V', 'col_suffix': '_mean'},
+    {'signal': 'FC_MinCellVoltage',  'label': '最小单体电压',   'unit': 'mV',   'col_suffix': '_mean'},
 ]
 _DEFAULT_Y_SIGNAL = _Y_SIGNAL_OPTIONS[0]['signal']
 # X 轴模式

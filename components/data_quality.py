@@ -159,16 +159,17 @@ def _fig_interval_hist(diffs: pd.Series) -> go.Figure:
 
 
 # Mock 工况参数设定(与 utils/mock_data.py 生成逻辑一致)
+# 单位严格遵循企业 9 字段口径:最小/平均单体电压为 mV,离均差为 mV,绝缘为 kΩ
 _MOCK_PARAMS = {
-    'FC_CurrOut': '50-80(启动) / 150-400(运行) A',
-    'FC_VoltOut': '280-380 V',
-    'FC_NetPwrOut': '= I×V/1000 + 噪声, clip 0-150 kW',
-    'FC_MinCellVoltage': 'avg-0.1~0.4, 1% 骤降至 2.0V',
-    'FC_MinVoltageChannel': '1-120 整数',
-    'FC_AvgCellVoltage': '3.3-3.9 V',
-    'FC_AvgCellVoltDev': '-0.3 ~ +0.3 V',
-    'FC_VehicleIsolationR': '500-2000, 0.5% 掉至 300 kΩ',
-    'FC_RunTime_Hours': 'base + 每秒累计递增 h',
+    'FC_CurrOut':            '50-80(启动) / 150-400(运行) A',
+    'FC_VoltOut':            '280-380 V',
+    'FC_NetPwrOut':          '= I×V/1000 + 噪声, clip 0-150 kW',
+    'FC_MinCellVoltage':     'avg-100~400 mV, 1% 骤降至 2000 mV (企业口径 mV)',
+    'FC_MinVoltageChannel':  '1-120 整数',
+    'FC_AvgCellVoltage':     '3300-3900 mV (企业口径 mV)',
+    'FC_AvgCellVoltDev':     '-300 ~ +300 mV (企业口径 mV)',
+    'FC_VehicleIsolationR':  '500-2000, 0.5% 掉至 300 kΩ',
+    'FC_RunTime_Hours':      'base + 每秒累计递增 h',
 }
 
 

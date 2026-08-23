@@ -15,15 +15,16 @@ import pandas as pd
 # ---------- 信号中文映射 ----------
 
 SIGNAL_MAP: dict[str, str] = {
-    'FC_CurrOut': '电堆输出电流 (A)',
-    'FC_VoltOut': '电堆输出电压 (V)',
-    'FC_NetPwrOut': '系统净功率 (kW)',
-    'FC_MinCellVoltage': '最小单体电压 (V)',
-    'FC_MinVoltageChannel': '最小电压通道',
-    'FC_AvgCellVoltage': '平均单体电压 (V)',
-    'FC_AvgCellVoltDev': '离均差 (V)',
-    'FC_VehicleIsolationR': '绝缘电阻 (kΩ)',
-    'FC_RunTime_Hours': '运行时间 (h)',
+    # ↓↓↓ 与企业 9 个核心字段(ai_assistant 口径)逐一严格对齐:字段名/中文名/单位一致
+    'FC_CurrOut':            '电堆输出电流 (A)',
+    'FC_VoltOut':            '电堆输出电压 (V)',
+    'FC_NetPwrOut':          '系统净功率输出 (kW)',
+    'FC_MinCellVoltage':     '最小单体电压 (mV)',
+    'FC_MinVoltageChannel':  '最小电压所在通道',
+    'FC_AvgCellVoltage':     '平均单体电压 (mV)',
+    'FC_AvgCellVoltDev':     '离均差 (mV)',         # 电压一致性指标,单位 mV
+    'FC_VehicleIsolationR':  '车辆绝缘电阻 (kΩ)',
+    'FC_RunTime_Hours':      '系统累计运行时间 (h)',
 }
 
 # 通道号列(重采样时用 last 聚合,而非均值)

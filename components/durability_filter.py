@@ -28,11 +28,27 @@ logger = logging.getLogger(__name__)
 _RIGS = ['台架A', '台架B', '台架C']
 _DEFAULT_POWER_POINTS: List[float] = [33.0, 58.5, 117.0, 156.0, 175.5, 195.0]
 
-# 信号选项与默认(默认前两个):企业要求补 LFR/HFR 两个阻抗信号
+# 信号选项与默认(默认前两个): 企业 9 个字段优先 + 扩展阻抗/方差/电堆辅助字段
+#
+# 企业 9 字段基准 (与 utils/helpers.SIGNAL_MAP、src/ai_assistant.py 三处完全对齐):
+#   1) FC_CurrOut          电堆输出电流 (A)
+#   2) FC_VoltOut          电堆输出电压 (V)
+#   3) FC_NetPwrOut        系统净功率输出 (kW)
+#   4) FC_MinCellVoltage   最小单体电压 (mV)
+#   5) FC_MinVoltageChannel 最小电压所在通道
+#   6) FC_AvgCellVoltage   平均单体电压 (mV)
+#   7) FC_AvgCellVoltDev   离均差 (mV)
+#   8) FC_VehicleIsolationR 车辆绝缘电阻 (kΩ)
+#   9) FC_RunTime_Hours    系统累计运行时间 (h)
 _SIGNAL_OPTIONS = [
+    # ---------- 企业 9 个核心字段(按顺序放在最前) ----------
+    'FC_CurrOut', 'FC_VoltOut', 'FC_NetPwrOut',
+    'FC_MinCellVoltage', 'FC_MinVoltageChannel',
     'FC_AvgCellVoltage', 'FC_AvgCellVoltDev',
-    'FC_LFR', 'FC_HFR',                  # 低频阻抗 / 高频阻抗(企业新增)
-    'FC_VARVoltage', 'FC_NetPwrOut', 'FC_VoltOut',
+    'FC_VehicleIsolationR', 'FC_RunTime_Hours',
+    # ---------- 功能4 扩展字段(耐久台架专属,企业新增 LFR/HFR) ----------
+    'FC_LFR', 'FC_HFR',                      # 低频阻抗 / 高频阻抗
+    'FC_VARVoltage',                         # 单体电压方差(=离均差²)
 ]
 _DEFAULT_SIGNALS = _SIGNAL_OPTIONS[:2]
 
@@ -47,8 +63,9 @@ _FOUR_PANEL_TITLES: dict = {
     'FC_LFR':           '低频阻抗 LFR',
     'FC_HFR':           '高频阻抗 HFR',
 }
+# 单位: 与企业 9 字段(SIGNAL_MAP/ai_assistant)口径对齐:电压/离均差用 mV,阻抗用 mΩ·cm²
 _FOUR_PANEL_UNITS: dict = {
-    'FC_AvgCellVoltage': 'V',
+    'FC_AvgCellVoltage': 'mV',
     'FC_AvgCellVoltDev': 'mV',
     'FC_LFR':           'mΩ·cm²',
     'FC_HFR':           'mΩ·cm²',
@@ -345,11 +362,15 @@ if __name__ == '__main__':
     assert _RIGS == ['台架A', '台架B', '台架C']
     assert _MAX_HOURS == 24 * 7
     assert _SIGNAL_OPTIONS == [
+        # 企业9个核心字段(顺序固定)
+        'FC_CurrOut', 'FC_VoltOut', 'FC_NetPwrOut',
+        'FC_MinCellVoltage', 'FC_MinVoltageChannel',
         'FC_AvgCellVoltage', 'FC_AvgCellVoltDev',
-        'FC_LFR', 'FC_HFR',
-        'FC_VARVoltage', 'FC_NetPwrOut', 'FC_VoltOut',
+        'FC_VehicleIsolationR', 'FC_RunTime_Hours',
+        # 功能4扩展字段
+        'FC_LFR', 'FC_HFR', 'FC_VARVoltage',
     ]
-    assert _DEFAULT_SIGNALS == ['FC_AvgCellVoltage', 'FC_AvgCellVoltDev']
+    assert _DEFAULT_SIGNALS == ['FC_CurrOut', 'FC_VoltOut']
     assert _ALERT_CONDITIONS == ['离均差>50mV', '平均单体电压<600mV']
     assert _ALERT_CONDITION_2_OPTIONS == ['无', '离均差>50mV', '平均单体电压<600mV']
     assert _ALERT_ACTIONS == ['飞书通知', '邮件通知', '仅页面显示']

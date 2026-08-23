@@ -206,7 +206,7 @@ from datetime import datetime
 from components.filter_bar import render_filter_bar
 from components.stats import render_stats
 from components.chart import create_figure
-from utils.helpers import filter_by_time, resample_data, detect_anomalies
+from utils.helpers import filter_by_time, resample_data, detect_anomalies, SIGNAL_MAP
 from utils.mock_data import generate_mock_data
 from components.theme import apply_custom_css
 from components.data_quality import render_data_quality
@@ -1461,9 +1461,21 @@ def _render_tab_compare(
     )
     cmp_col = st.selectbox(
         "对比指标",
-        ["FC_NetPwrOut", "FC_VoltOut", "FC_CurrOut",
-         "FC_AvgCellVoltage", "FC_VehicleSpd"],
-        index=0,
+        # 选项1: 企业 9 个核心字段(按 SIGNAL_MAP 顺序)
+        [
+            "FC_CurrOut", "FC_VoltOut", "FC_NetPwrOut",
+            "FC_MinCellVoltage", "FC_AvgCellVoltage",
+            "FC_AvgCellVoltDev", "FC_VehicleIsolationR",
+            "FC_RunTime_Hours",
+            # 选项2: 扩展常用辅助字段
+            "FC_VehicleSpd",
+        ],
+        index=2,   # 默认系统净功率输出(企业关注核心)
+        format_func=lambda c: (
+            SIGNAL_MAP.get(c, c)
+            if c in SIGNAL_MAP
+            else {"FC_VehicleSpd": "车辆车速 (km/h)"}.get(c, c)
+        ),
     )
 
     if cmp_mode == "多车横向对比":
