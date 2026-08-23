@@ -753,6 +753,11 @@ def _rows_to_list(rows) -> List[Dict[str, Any]]:
     return [dict(r._mapping) for r in rows]
 
 
+def _row_to_dict(row) -> Dict[str, Any]:
+    """把单条 RowResult 转 dict（row=None 时返回空 dict，不安全；调用方自己判 None）。"""
+    return dict(row._mapping)
+
+
 def _next_seq(table_name: str) -> int:
     t = {"feishu_contacts": _feishu_contacts,
          "alert_events": _alert_events,
@@ -1403,6 +1408,208 @@ def db_list_data_files_paginated(
     except Exception as e:
         logger.warning("db_list_data_files_paginated 失败: %s", e)
         return []
+
+
+def db_get_data_file(file_id: int) -> Optional[Dict]:
+    """按 ID 获取单个文件索引记录。"""
+    from sqlalchemy import select
+
+    def _do() -> Optional[Dict]:
+        with _engine.connect() as conn:
+            row = conn.execute(
+                select(_vehicle_data_files).where(_vehicle_data_files.c.id == int(file_id))
+            ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    try:
+        return _run_with_fallback("db_get_data_file", _do)
+    except Exception as e:
+        logger.warning("[文件查询] db_get_data_file(id=%s) 失败: %s", file_id, e)
+        return None
+
+
+def db_rename_data_file(file_id: int, new_file_name: str) -> Tuple[bool, str]:
+    """重命名已入库数据文件（只改 vehicle_data_files.file_name）。
+
+    原子性: 在同一事务内执行; 带唯一性校验（同车号/类型下同名冲突则拒绝）。
+
+    返回: (是否成功, 说明)
+    """
+    from sqlalchemy import select, and_
+    import time as _t
+
+    t0 = _t.perf_counter()
+    new_file_name = (new_file_name or "").strip()
+    if not new_file_name:
+        return False, "新文件名不能为空"
+    if len(new_file_name) > 512:
+        return False, "文件名长度不能超过 512 字符"
+    try:
+        file_id_i = int(file_id)
+    except (TypeError, ValueError):
+        return False, f"非法 file_id: {file_id}"
+
+    logger.info(
+        "[文件重命名] 🔄 开始: file_id=%d, new_name=%s",
+        file_id_i, new_file_name,
+    )
+
+    def _do() -> Tuple[bool, str]:
+        with _engine.connect() as conn:
+            # 1) 查原文件
+            old = conn.execute(
+                select(_vehicle_data_files).where(_vehicle_data_files.c.id == file_id_i)
+            ).fetchone()
+            if old is None:
+                return False, f"文件 ID={file_id_i} 不存在"
+            old_d = _row_to_dict(old)
+            old_name = str(old_d.get("file_name", ""))
+            if old_name == new_file_name:
+                return True, "文件名未变化,无需更新"
+
+            # 2) 冲突检测: 同 data_kind + vehicle_id 下不能有重名
+            kind = old_d.get("data_kind", "")
+            vid = old_d.get("vehicle_id", "") or ""
+            dup = conn.execute(
+                select(_vehicle_data_files.c.id)
+                .where(and_(
+                    _vehicle_data_files.c.data_kind == kind,
+                    _vehicle_data_files.c.vehicle_id == vid,
+                    _vehicle_data_files.c.file_name == new_file_name,
+                    _vehicle_data_files.c.id != file_id_i,
+                ))
+            ).fetchone()
+            if dup is not None:
+                return False, f"命名冲突: 同类型下已存在同名文件「{new_file_name}」"
+
+            # 3) 执行更新
+            conn.execute(
+                _vehicle_data_files.update()
+                .where(_vehicle_data_files.c.id == file_id_i)
+                .values(file_name=new_file_name)
+            )
+            conn.commit()
+        return True, f"已重命名:「{old_name}」→「{new_file_name}」"
+
+    try:
+        ok, msg = _run_with_fallback("db_rename_data_file", _do)
+        cost = (_t.perf_counter() - t0) * 1000
+        if ok:
+            logger.info(
+                "[文件重命名] ✅ 成功 | file_id=%d | %s | 耗时=%.0fms",
+                file_id_i, msg, cost,
+            )
+        else:
+            logger.warning(
+                "[文件重命名] ⚠️ 被拒绝 | file_id=%d | 原因=%s | 耗时=%.0fms",
+                file_id_i, msg, cost,
+            )
+        return ok, msg
+    except Exception as e:
+        cost = (_t.perf_counter() - t0) * 1000
+        logger.error(
+            "[文件重命名] ❌ 异常 | file_id=%d | err=%s | 耗时=%.0fms",
+            file_id_i, e, cost, exc_info=True,
+        )
+        return False, f"重命名失败: {_extract_error_summary(e)}"
+
+
+def db_delete_data_file(file_id: int, *, op_user: str = "ui") -> Tuple[bool, str]:
+    """删除已入库数据文件 + 级联清理三张大表中同 file_id 关联数据。
+
+    级联范围（事务内原子执行）:
+      - vehicle_minute_samples WHERE file_id=X
+      - durability_stages     WHERE file_id=X
+      - bench_cycle_stats     WHERE file_id=X
+      - vehicle_data_files    WHERE id=X
+
+    返回: (是否成功, 说明)
+    """
+    from sqlalchemy import select, delete
+    import time as _t
+
+    t0 = _t.perf_counter()
+    try:
+        file_id_i = int(file_id)
+    except (TypeError, ValueError):
+        return False, f"非法 file_id: {file_id}"
+
+    logger.info(
+        "[文件删除] 🗑️ 开始: file_id=%d, op_user=%s",
+        file_id_i, op_user or "(unknown)",
+    )
+
+    def _do() -> Tuple[bool, str]:
+        with _engine.connect() as conn:
+            # 1) 查原文件,确认存在
+            old = conn.execute(
+                select(_vehicle_data_files).where(_vehicle_data_files.c.id == file_id_i)
+            ).fetchone()
+            if old is None:
+                return False, f"文件 ID={file_id_i} 不存在"
+            old_d = _row_to_dict(old)
+            file_name = str(old_d.get("file_name", "?"))
+            kind = str(old_d.get("data_kind", ""))
+
+            # 2) 级联删除三张大表（按 file_id）
+            cnt_vms = conn.execute(
+                delete(_vehicle_minute_samples).where(
+                    _vehicle_minute_samples.c.file_id == file_id_i
+                )
+            ).rowcount or 0
+
+            cnt_ds = conn.execute(
+                delete(_durability_stages).where(
+                    _durability_stages.c.file_id == file_id_i
+                )
+            ).rowcount or 0
+
+            cnt_bcs = conn.execute(
+                delete(_bench_cycle_stats).where(
+                    _bench_cycle_stats.c.file_id == file_id_i
+                )
+            ).rowcount or 0
+
+            # 3) 删除文件索引本身
+            cnt_vdf = conn.execute(
+                delete(_vehicle_data_files).where(
+                    _vehicle_data_files.c.id == file_id_i
+                )
+            ).rowcount or 0
+
+            conn.commit()
+        return (
+            True,
+            (
+                f"已删除「{file_name}」(类型={kind}): "
+                f"文件索引 {cnt_vdf} 条, "
+                f"整车分钟 {cnt_vms} 条, "
+                f"耐久工步 {cnt_ds} 条, "
+                f"台架统计 {cnt_bcs} 条"
+            ),
+        )
+
+    try:
+        ok, msg = _run_with_fallback("db_delete_data_file", _do)
+        cost = (_t.perf_counter() - t0) * 1000
+        if ok:
+            logger.info(
+                "[文件删除] ✅ 成功 | file_id=%d | op=%s | %s | 耗时=%.0fms",
+                file_id_i, op_user, msg, cost,
+            )
+        else:
+            logger.warning(
+                "[文件删除] ⚠️ 被拒绝 | file_id=%d | 原因=%s | 耗时=%.0fms",
+                file_id_i, msg, cost,
+            )
+        return ok, msg
+    except Exception as e:
+        cost = (_t.perf_counter() - t0) * 1000
+        logger.error(
+            "[文件删除] ❌ 异常 | file_id=%d | err=%s | 耗时=%.0fms",
+            file_id_i, e, cost, exc_info=True,
+        )
+        return False, f"删除失败: {_extract_error_summary(e)}"
 
 
 # =========================================================================

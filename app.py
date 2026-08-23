@@ -57,6 +57,10 @@ from durability.database import (
     db_get_upload_summary,
     db_list_data_files_paginated,
     db_list_data_files,
+    # ===== 上传历史: 删除 / 重命名 =====
+    db_delete_data_file,
+    db_rename_data_file,
+    db_get_data_file,
 )
 # 启动期 DB 初始化 (MySQL 不可达自动降级 SQLite)
 _db_init()
@@ -271,6 +275,15 @@ st.set_page_config(
 
 # 企业级深色科技主题(全局 CSS 注入,仅需调用一次)
 apply_custom_css()
+
+# ============================================================
+# 🎯 顶部 Tab 栏 · 横向滑块 (解决窄屏时右侧 Tab 被「封锁」看不到的问题)
+# - 对页面所有 st.tabs(...) 全局生效
+# - 绝不修改 Streamlit Tab DOM 结构, 只加 CSS/同级插入按钮/事件监听
+# - 手动拉窄窗口 / 平板 / 手机上都可拖动/点 ◀ ▶ 看被遮挡的「整车/耐久/报告...」Tab
+from components.tab_slider import enable_tab_slider
+enable_tab_slider()
+# ============================================================
 
 # 顶部标题栏 - LetterGlitch 故障风格动画
 render_letter_glitch(
@@ -2013,6 +2026,112 @@ def _render_tab_history() -> None:
     }
     display_df = display_df.rename(columns={k: v for k, v in col_names.items() if k in show_cols})
     st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # === 2B. 文件管理: 重命名 / 删除 (UI-入库文件操作) ===
+    st.divider()
+    st.subheader("🛠️ 文件管理 (入库记录)")
+    st.caption("选择一个已入库文件进行「重命名」或「删除」。删除会同步清理该车/工步/台架统计中与该文件关联的全部明细数据。")
+
+    mg_col1, mg_col2 = st.columns([1, 2])
+    with mg_col1:
+        mg_opts = [
+            (i, f"[ID:{f.get('id')}] {f.get('file_name','?')} ({f.get('data_kind','')})")
+            for i, f in enumerate(files)
+        ]
+        if not mg_opts:
+            st.info("暂无可操作的文件。请先上传数据。")
+            mg_sel_idx = None
+        else:
+            mg_sel_idx = st.selectbox(
+                "选择目标文件",
+                options=[i for i, _ in mg_opts],
+                format_func=lambda i: mg_opts[i][1],
+                index=0,
+                key="history_mg_file_selector",
+            )
+    target_file = files[mg_sel_idx] if mg_sel_idx is not None else None
+
+    if target_file is not None:
+        fid = target_file.get("id")
+        fname_cur = target_file.get("file_name", "")
+        with mg_col2:
+            mg_mode = st.radio(
+                "操作类型",
+                ["✏️ 重命名", "🗑️ 删除"],
+                index=0,
+                horizontal=True,
+                key="history_mg_mode",
+            )
+            if mg_mode == "✏️ 重命名":
+                new_name = st.text_input(
+                    "新文件名（含后缀）",
+                    value=fname_cur,
+                    max_chars=512,
+                    key="history_rename_new_name",
+                )
+                confirm_rename = st.checkbox(
+                    f"我确认要将 ID={fid} 的文件重命名为「{new_name}」",
+                    value=False,
+                    key="history_rename_confirm",
+                )
+                if st.button("⚠️ 执行重命名", key="btn_do_rename", type="secondary",
+                             disabled=not confirm_rename):
+                    with st.spinner("正在更新数据库..."):
+                        ok, msg = db_rename_data_file(int(fid), new_name)
+                    if ok:
+                        st.success(f"✅ {msg}")
+                        # 清缓存并重渲染
+                        try:
+                            st.cache_data.clear()
+                        except Exception:
+                            pass
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {msg}")
+
+            else:  # 删除
+                kind = target_file.get("data_kind", "")
+                rows = target_file.get("row_count", 0)
+                vehicle = target_file.get("vehicle_id", "")
+                st.markdown(
+                    f"**待删除信息:**\n\n"
+                    f"- 类型: `{kind}`\n"
+                    f"- 车号: `{vehicle or '(空)'}`\n"
+                    f"- 文件: `{fname_cur}`\n"
+                    f"- 行数: {rows:,}\n\n"
+                    f"⚠️ **级联删除**: 以下关联数据也会同步删除（不可恢复）:\n"
+                    f"- 整车分钟级明细 (vehicle_minute_samples)\n"
+                    f"- 耐久工步数据 (durability_stages)\n"
+                    f"- 台架循环统计 (bench_cycle_stats)\n"
+                    f"- 文件索引本身 (vehicle_data_files)"
+                )
+                confirm_del_text = f"我确认要永久删除 ID={fid} 「{fname_cur}」及其全部关联数据"
+                confirm_del = st.checkbox(
+                    confirm_del_text,
+                    value=False,
+                    key="history_delete_confirm",
+                )
+                confirm_del2 = st.checkbox(
+                    "我已阅读以上风险, 确认删除（不可恢复）",
+                    value=False,
+                    key="history_delete_confirm2",
+                )
+                can_delete = confirm_del and confirm_del2
+                if st.button("🔥 永久删除 (此操作不可撤销)", key="btn_do_delete",
+                             type="primary", disabled=not can_delete):
+                    with st.spinner("正在执行级联删除..."):
+                        ok, msg = db_delete_data_file(int(fid), op_user="streamlit-ui")
+                    if ok:
+                        st.success(f"✅ {msg}")
+                        try:
+                            st.cache_data.clear()
+                        except Exception:
+                            pass
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {msg}")
+
+    st.divider()
 
     # === 3. 数据回看 (按需加载,不自动查询) ===
     st.subheader("📂 数据回看")
