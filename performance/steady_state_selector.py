@@ -201,11 +201,8 @@ def find_steady_segments(
 
 if __name__ == '__main__':
     import time
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    )
+    from src.log_config import setup_logging
+    setup_logging(level=logging.INFO)
 
     # 构造测试数据(1 秒均匀采样, 600 个点):
     #   0-199s   电流=95  (稳态段A, 200s >= 180s, 保留)

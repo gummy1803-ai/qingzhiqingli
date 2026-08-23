@@ -14,7 +14,7 @@ from utils.helpers import SIGNAL_MAP
 
 # ---------- 常量 ----------
 _VEHICLES = ['212', '345']
-_DEFAULT_SIGNALS = ['FC_CurrOut', 'FC_VoltOut']
+_DEFAULT_SIGNALS = ['FC_AvgCellVoltage', 'FC_CurrOut']
 _MAX_HOURS = 6  # 最大允许时间跨度(防数据量过大)
 
 

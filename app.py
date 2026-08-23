@@ -1548,6 +1548,13 @@ def _render_tab_bench() -> None:
         cnt_col = '数据量' if '数据量' in agg_df.columns else None
         qual_col = '质量标记' if '质量标记' in agg_df.columns else None
 
+        logger.info(
+            "[预警检测] 开始扫描 agg_df: rows=%d dev_col=%s avg_col=%s "
+            "阈值=离均差>%.0fmV 电压<%.0fmV",
+            len(agg_df), dev_col, avg_col, _dev_thresh, _avg_thresh,
+        )
+        n_hits_dev = 0
+        n_hits_avg = 0
         for _, row in agg_df.iterrows():
             ts = datetime.now()
             cyc = int(row.get('cycle_id', 0))
@@ -1558,6 +1565,7 @@ def _render_tab_bench() -> None:
             if dev_col:
                 dev = float(row[dev_col[0]]) if pd.notna(row[dev_col[0]]) else 0
                 if dev > _dev_thresh:
+                    n_hits_dev += 1
                     raw_alert_events.append({
                         'timestamp': ts, 'cycle_id': cyc, 'power_point': pp,
                         'condition': f'离均差>{_dev_thresh:.0f}mV',
@@ -1569,6 +1577,7 @@ def _render_tab_bench() -> None:
             if avg_col:
                 avg_v = float(row[avg_col[0]]) if pd.notna(row[avg_col[0]]) else 0
                 if 0 < avg_v < _avg_thresh:
+                    n_hits_avg += 1
                     raw_alert_events.append({
                         'timestamp': ts, 'cycle_id': cyc, 'power_point': pp,
                         'condition': f'平均单体电压<{_avg_thresh:.0f}mV',
@@ -1580,6 +1589,11 @@ def _render_tab_bench() -> None:
                             f"{avg_v:.1f}mV < {_avg_thresh:.0f}mV"
                         ),
                     })
+
+        logger.info(
+            "[预警检测] 扫描完成: 总行数=%d 命中离均差=%d 命中电压=%d 合计命中=%d",
+            len(agg_df), n_hits_dev, n_hits_avg, len(raw_alert_events),
+        )
 
     # ---------- ③ 幂等 + 真实 DB 写入 + 飞书推送 ----------
     from durability.database import (

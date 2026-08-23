@@ -223,11 +223,8 @@ if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
     from performance.steady_state_selector import find_steady_segments
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    )
+    from src.log_config import setup_logging
+    setup_logging(level=logging.INFO)
 
     # 构造测试数据(1 秒采样, 600 点):
     #   0-399s 电流=95(稳态,中间200-201扰动会被合并成1段)

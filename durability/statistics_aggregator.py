@@ -215,11 +215,8 @@ if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
     from durability.data_parser import parse_durability_data
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    )
+    from src.log_config import setup_logging
+    setup_logging(level=logging.INFO)
 
     rng = np.random.default_rng(42)
 

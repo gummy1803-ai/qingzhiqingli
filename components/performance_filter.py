@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 # ---------- 常量(与 filter_bar.py 保持一致) ----------
 _VEHICLES = ['212', '345']
 _MAX_HOURS = 6  # 最大允许时间跨度(防数据量过大)
-_DEFAULT_CURRENT_POINTS = '95±5\n100±5\n150±10'  # 燃电典型工况点
-_DEFAULT_MIN_DURATION = 60  # 默认最短稳态持续 60s(mock 数据波动频繁,180s 过严)
+_DEFAULT_CURRENT_POINTS = '95±5\n105±5\n115±5'  # 企业典型工况点(示例:95±5A / 105±5A / 115±5A)
+_DEFAULT_MIN_DURATION = 180  # 企业标准:稳态段需持续 >180s 才视为有效工况
 _DEFAULT_WARMUP_SECONDS = 180  # 企业默认: 稳态段丢弃前 180s 过渡热机期
 
 # Y 轴可选信号 + 对应显示名 + 单位 (与企业 9 字段 SIGNAL_MAP/ai_assistant 口径严格对齐)
@@ -280,10 +280,8 @@ def render_performance_filter() -> dict:
 # ---------- 单元测试示例(仅测试纯解析函数) ----------
 
 if __name__ == '__main__':
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    )
+    from src.log_config import setup_logging
+    setup_logging(level=logging.INFO)
 
     print("===== 测试1: 标准多行解析 =====")
     pts = _parse_current_points("95±5\n100±5\n150±10")

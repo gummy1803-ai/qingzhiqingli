@@ -998,6 +998,7 @@ def db_get_event_status_map(eids: List[str]) -> Dict[str, str]:
     if not eids:
         return {}
     from sqlalchemy import select
+    t0 = time.perf_counter()
 
     def _do() -> Dict[str, str]:
         stmt = select(_alert_events.c.id, _alert_events.c.status).where(
@@ -1006,7 +1007,10 @@ def db_get_event_status_map(eids: List[str]) -> Dict[str, str]:
         with _engine.connect() as conn:
             rows = conn.execute(stmt).fetchall()
         return {r._mapping["id"]: r._mapping["status"] for r in rows}
-    return _run_with_fallback("db_get_event_status_map", _do)
+    result = _run_with_fallback("db_get_event_status_map", _do)
+    logger.info("[DB查询] db_get_event_status_map eids=%d 返回=%d | 耗时=%.1fms",
+                len(eids), len(result), (time.perf_counter() - t0) * 1000)
+    return result
 
 
 def db_set_event_status(eid: str, status: str) -> None:

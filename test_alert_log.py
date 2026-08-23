@@ -13,6 +13,10 @@ from pathlib import Path
 # 项目根加入 sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# 使用统一日志配置 (支持 UTF-8 编码修复)
+from src.log_config import setup_logging
+setup_logging(level=logging.INFO)
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -23,11 +27,6 @@ from components.durability_alert_log import (
     _STATUS_PENDING,
     _STATUS_CONFIRMED,
     _STATUS_IGNORED,
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
 )
 
 # ============================================================
