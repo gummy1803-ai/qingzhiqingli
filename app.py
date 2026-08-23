@@ -52,6 +52,10 @@ from durability.database import (
     db_load_durability_stages,
     db_load_bench_cycle_stats,
     db_bench_ids_by_event,
+    # ===== 上传历史记录 =====
+    db_get_upload_summary,
+    db_list_data_files_paginated,
+    db_list_data_files,
 )
 # 启动期 DB 初始化 (MySQL 不可达自动降级 SQLite)
 _db_init()
@@ -1137,15 +1141,15 @@ if _recognized:
 
 # ---------- 主区域 Tab（按企业优先级排序） ----------
 # [核心功能区 1-4] 企业需求四大功能
-# [补充功能区 5-11] 原整车看板/耐久衰减/趋势预测等辅助功能
+# [补充功能区 5-12] 原整车看板/耐久衰减/趋势预测等辅助功能
 # 顺序编号用于「一键跳转」按钮的 ASCII 箭头引导提示
-tab_fc, tab_perf, tab_insul, tab_bench, tab_overview, tab_dur, tab_forecast, tab_cmp, tab_report, tab_ai, tab_contacts = st.tabs([
+tab_fc, tab_perf, tab_insul, tab_bench, tab_overview, tab_dur, tab_forecast, tab_cmp, tab_report, tab_ai, tab_contacts, tab_history = st.tabs([
     # 核心功能区(前4)
     "⚡ 燃电运行看板",     # 功能1: 燃电关键运行数据显示 (企业需求第1项)
     "📈 性能统计预测",     # 功能2: 燃电性能统计及预测 (企业需求第2项)
     "🔌 绝缘阻值统计",     # 功能3: 绝缘阻值统计及预测 (企业需求第3项)
     "🔬 台架耐久统计及预警",# 功能4: 台架耐久数据统计及预警 (企业需求第4项)
-    # 补充功能区(后7)
+    # 补充功能区(后8)
     "整车看板",            # 辅助:整车数据汇总概览
     "耐久衰减",            # 辅助:耐久工步(docx)衰减分析
     "趋势预测",            # 辅助:整车历史线性回归预测
@@ -1153,6 +1157,7 @@ tab_fc, tab_perf, tab_insul, tab_bench, tab_overview, tab_dur, tab_forecast, tab
     "报告导出",            # 系统:报告一键导出
     "AI 助手",            # 系统:AI 智能解答(全产品)
     "📡 飞书人员对接",     # 系统:飞书预警联系人配置
+    "📁 上传历史",         # 系统:上传历史记录及数据回看
 ])
 
 
@@ -1866,9 +1871,162 @@ def _render_tab_bench() -> None:
 
 @tab_safe_render
 def _render_tab_contacts() -> None:
-    """Tab4: 飞书人员对接。"""
+    """Tab11: 飞书人员对接。"""
     from components.feishu_contacts import render_feishu_contacts
     render_feishu_contacts()
+
+
+@tab_safe_render
+def _render_tab_history() -> None:
+    """Tab12: 上传历史记录及数据回看。"""
+    st.header("📁 上传历史记录")
+    st.caption("查看所有已上传的数据文件历史,支持按类型筛选和数据回看")
+
+    # 获取汇总统计
+    summary = db_get_upload_summary()
+
+    # 汇总卡片
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("总文件数", summary['total_files'])
+    with col2:
+        st.metric("总行数", f"{summary['total_rows']:,}")
+    with col3:
+        kinds = summary.get('by_kind', {})
+        st.metric("数据类型", len(kinds))
+    with col4:
+        latest = summary.get('latest_upload', '')
+        st.metric("最新上传", latest or "暂无")
+
+    # 按类型分组显示
+    if kinds:
+        st.subheader("按类型统计")
+        cols = st.columns(len(kinds))
+        kind_icons = {'整车': '🚗', '耐久工步': '📉', '台架循环': '🔬'}
+        for i, (kind, info) in enumerate(kinds.items()):
+            with cols[i % len(cols)]:
+                icon = kind_icons.get(kind, '📄')
+                st.markdown(f"**{icon} {kind}**")
+                st.caption(f"{info['count']} 个文件 · {info['rows']:,} 行")
+
+    # 按车辆分组
+    by_vehicle = summary.get('by_vehicle', {})
+    if by_vehicle:
+        st.subheader("按车辆统计 (整车数据)")
+        for vehicle_id, info in by_vehicle.items():
+            st.markdown(f"- **车辆 {vehicle_id}**: {info['files']} 个文件 · {info['rows']:,} 行")
+
+    st.divider()
+
+    # 上传文件列表
+    st.subheader("文件历史记录")
+
+    # 筛选控件
+    filter_col1, filter_col2 = st.columns([2, 1])
+    with filter_col1:
+        kind_filter = st.selectbox(
+            "按类型筛选",
+            options=["全部", "整车", "耐久工步", "台架循环"],
+            index=0,
+            key="history_kind_filter",
+        )
+    with filter_col2:
+        page_size = st.selectbox("每页显示", [10, 20, 50], index=1, key="history_page_size")
+
+    kind_param = None if kind_filter == "全部" else kind_filter
+
+    # 获取文件列表
+    files = db_list_data_files_paginated(data_kind=kind_param, limit=page_size, offset=0)
+
+    if not files:
+        st.info("暂无上传记录。请前往首页「上传文件」或使用「内置数据」模式导入数据。")
+        return
+
+    # 显示文件列表为 DataFrame
+    display_df = pd.DataFrame(files)
+    if len(display_df) > 0:
+        # 选择要显示的列
+        show_cols = ['id', 'data_kind', 'vehicle_id', 'file_name', 'row_count', 'uploaded_at', 'status']
+        show_cols = [c for c in show_cols if c in display_df.columns]
+        display_df = display_df[show_cols]
+
+        # 重命名列
+        col_names = {
+            'id': 'ID',
+            'data_kind': '类型',
+            'vehicle_id': '车辆',
+            'file_name': '文件名',
+            'row_count': '行数',
+            'uploaded_at': '上传时间',
+            'status': '状态',
+        }
+        display_df = display_df.rename(columns={k: v for k, v in col_names.items() if k in show_cols})
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # 文件详情查看
+        st.subheader("📂 数据回看")
+        selected_id = st.selectbox(
+            "选择文件查看数据",
+            options=[f"{r.get('file_name', '?')} (ID:{r.get('id')})" for r in files],
+            index=0,
+            key="history_file_selector",
+        )
+
+        if selected_id:
+            sel_id = files[[f.get('file_name') for f in files].index(
+                selected_id.split(" (ID:")[0])]['id'] if " (ID:" in selected_id else None
+
+            if sel_id:
+                sel_file = next((f for f in files if f['id'] == sel_id), None)
+                if sel_file:
+                    col1, col2 = st.columns([1, 2])
+                    with col1:
+                        st.markdown(f"**文件信息:**")
+                        st.json({
+                            '类型': sel_file.get('data_kind'),
+                            '车辆': sel_file.get('vehicle_id'),
+                            '文件名': sel_file.get('file_name'),
+                            '行数': sel_file.get('row_count'),
+                            '上传时间': sel_file.get('uploaded_at'),
+                            '状态': sel_file.get('status'),
+                        })
+                    with col2:
+                        # 根据类型加载历史数据
+                        kind = sel_file.get('data_kind', '')
+                        vehicle_id = sel_file.get('vehicle_id', '')
+
+                        if kind == '整车' and vehicle_id:
+                            st.markdown(f"**车辆 {vehicle_id} 历史数据:**")
+                            hist_df = db_load_vehicle_minute(vehicle_id)
+                            if len(hist_df) > 0:
+                                st.dataframe(hist_df.head(100), use_container_width=True)
+                                st.caption(f"共 {len(hist_df)} 条分钟数据,显示前 100 条")
+                            else:
+                                st.info("该车辆暂无分钟级数据")
+
+                        elif kind == '耐久工步':
+                            st.markdown("**耐久工步历史数据:**")
+                            dur_df = db_load_durability_stages()
+                            if len(dur_df) > 0:
+                                st.dataframe(dur_df, use_container_width=True)
+                            else:
+                                st.info("暂无耐久工步数据")
+
+                        elif kind == '台架循环':
+                            st.markdown("**台架循环历史数据:**")
+                            bench_df = db_load_bench_cycle_stats()
+                            if len(bench_df) > 0:
+                                st.dataframe(bench_df, use_container_width=True)
+                            else:
+                                st.info("暂无台架循环数据")
+
+                        else:
+                            st.info("暂无可回看的数据类型")
+
+    # 统计信息
+    st.divider()
+    st.caption(f"数据来源: {get_db_backend_info().get('backend', 'unknown')} | 共 {len(files)} 条记录")
 
 
 @tab_safe_render
@@ -2775,3 +2933,6 @@ with tab_ai:                            # [10] AI 智能解答(系统,全产品)
 
 with tab_contacts:                      # [11] 飞书预警联系人配置(系统)
     _render_tab_contacts()
+
+with tab_history:                       # [12] 上传历史记录及数据回看(系统)
+    _render_tab_history()

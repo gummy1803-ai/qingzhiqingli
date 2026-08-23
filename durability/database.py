@@ -1205,6 +1205,113 @@ def db_count_data_files(kind: Optional[str] = None) -> int:
         return 0
 
 
+def db_get_upload_summary() -> Dict:
+    """获取上传历史汇总统计(按类型分组)。
+
+    Returns:
+        {
+            'total_files': int,
+            'total_rows': int,
+            'by_kind': {'整车': {'count': N, 'rows': N}, ...},
+            'by_vehicle': {'212': {'files': N, 'rows': N}, ...},
+            'latest_upload': str,
+        }
+    """
+    from sqlalchemy import func, select
+
+    def _do() -> Dict:
+        with _engine.connect() as conn:
+            # 总计
+            total = conn.execute(
+                select(func.count()).select_from(_vehicle_data_files)
+            ).scalar() or 0
+            total_rows = conn.execute(
+                select(func.coalesce(func.sum(_vehicle_data_files.c.row_count), 0))
+            ).scalar() or 0
+
+            # 按类型分组
+            by_kind_rows = conn.execute(
+                select(
+                    _vehicle_data_files.c.data_kind,
+                    func.count().label('cnt'),
+                    func.coalesce(func.sum(_vehicle_data_files.c.row_count), 0).label('rows'),
+                )
+                .group_by(_vehicle_data_files.c.data_kind)
+            ).fetchall()
+
+            by_kind = {
+                r[0] or 'unknown': {'count': r[1], 'rows': r[2]}
+                for r in by_kind_rows
+            }
+
+            # 按车辆分组 (仅整车类)
+            by_vehicle_rows = conn.execute(
+                select(
+                    _vehicle_data_files.c.vehicle_id,
+                    func.count().label('cnt'),
+                    func.coalesce(func.sum(_vehicle_data_files.c.row_count), 0).label('rows'),
+                )
+                .where(_vehicle_data_files.c.data_kind == '整车')
+                .where(_vehicle_data_files.c.vehicle_id != '')
+                .group_by(_vehicle_data_files.c.vehicle_id)
+            ).fetchall()
+
+            by_vehicle = {
+                r[0]: {'files': r[1], 'rows': r[2]}
+                for r in by_vehicle_rows
+            }
+
+            # 最新上传时间
+            latest = conn.execute(
+                select(func.max(_vehicle_data_files.c.uploaded_at))
+            ).scalar() or ''
+
+        return {
+            'total_files': int(total),
+            'total_rows': int(total_rows),
+            'by_kind': by_kind,
+            'by_vehicle': by_vehicle,
+            'latest_upload': str(latest),
+        }
+
+    t0 = time.perf_counter()
+    try:
+        result = _run_with_fallback("db_get_upload_summary", _do)
+        logger.info("[上传汇总] files=%d rows=%d kinds=%d vehicles=%d | 耗时=%.1fms",
+                    result['total_files'], result['total_rows'],
+                    len(result['by_kind']), len(result['by_vehicle']),
+                    (time.perf_counter() - t0) * 1000)
+        return result
+    except Exception as e:
+        logger.warning("[上传汇总] 失败: %s", e)
+        return {'total_files': 0, 'total_rows': 0, 'by_kind': {}, 'by_vehicle': {}, 'latest_upload': ''}
+
+
+def db_list_data_files_paginated(
+    data_kind: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> List[Dict]:
+    """分页获取上传文件列表(用于前端展示)。"""
+    from sqlalchemy import select
+
+    def _do() -> List[Dict]:
+        stmt = select(_vehicle_data_files)
+        if data_kind:
+            stmt = stmt.where(_vehicle_data_files.c.data_kind == data_kind)
+        stmt = stmt.order_by(_vehicle_data_files.c.uploaded_at.desc())
+        stmt = stmt.limit(limit).offset(offset)
+        with _engine.connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+        return _rows_to_list(rows)
+
+    try:
+        return _run_with_fallback("db_list_data_files_paginated", _do)
+    except Exception as e:
+        logger.warning("db_list_data_files_paginated 失败: %s", e)
+        return []
+
+
 # =========================================================================
 # A2 · vehicle_minute_samples 整车分钟级明细 CRUD
 # =========================================================================
