@@ -204,8 +204,8 @@ def _quality_metrics(df: pd.DataFrame, label: str) -> None:
     m2.metric('异常率(3σ)', f'{anom_rate:.2f}%')
     m3.metric('采样均匀度', f'{uniformity:.1f}%')
 
-    with st.expander('详细统计 (describe)', expanded=False):
-        st.dataframe(df.describe(), use_container_width=True)
+    st.markdown('**详细统计 (describe)**')
+    st.dataframe(df.describe(), use_container_width=True)
 
 
 def render_data_quality(
@@ -295,9 +295,9 @@ def render_data_quality(
                             })
                 if miss_rows:
                     logger.info("缺失值明细: 共 %d 条", len(miss_rows))
-                    with st.expander('缺失值明细(具体位置)', expanded=False):
-                        st.dataframe(pd.DataFrame(miss_rows),
-                                     use_container_width=True, hide_index=True)
+                    st.markdown('**缺失值明细(具体位置)**')
+                    st.dataframe(pd.DataFrame(miss_rows),
+                                 use_container_width=True, hide_index=True)
 
                 st.markdown('**各列异常值数量(超出 mean±3σ)**')
                 anom = _anomaly_3sigma(df)
@@ -308,9 +308,9 @@ def render_data_quality(
                 details = _anomaly_details(df)
                 if len(details):
                     logger.info("异常点明细: 共 %d 条,渲染明细表", len(details))
-                    with st.expander('异常点明细(数值与计算过程)', expanded=True):
-                        st.dataframe(details, use_container_width=True,
-                                     hide_index=True)
+                    st.markdown('**异常点明细(数值与计算过程)**')
+                    st.dataframe(details, use_container_width=True,
+                                 hide_index=True)
                 else:
                     logger.info("无3σ异常点,显示提示")
                     st.info('未检测到 3σ 异常点')
