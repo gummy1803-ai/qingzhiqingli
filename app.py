@@ -379,36 +379,18 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    st.subheader("数据来源")
+    # 数据来源: 紧凑布局(移除路径/冗余说明)
     use_builtin = st.radio(
-        "选择数据",
-        ["使用内置数据(自动扫描)", "上传文件"],
+        "数据来源",
+        ["使用内置数据", "上传文件"],
         index=0,
-        label_visibility="collapsed",
+        label_visibility="visible",
     )
-
-    # 数据目录说明(告诉用户如何扔新数据进来)
-    with st.expander("💡 如何加入新车辆数据?", expanded=False):
-        st.markdown(
-            "**方式 1: 放到本地目录(推荐批量数据)**\n\n"
-            "把新车辆 CSV 分片放到:\n"
-            "```\n"
-            f"{(DATA_ROOT / '02_整车数据处理').resolve()}\n"
-            "```\n"
-            "**每个车辆一个子目录**(以车辆编号命名),目录内放该车的所有 CSV 分片。\n"
-            "格式: `<车辆编号>_<起时间>_<止时间>_CH0_<导入时间>.csv`\n\n"
-            "放好后刷新本页面即可自动识别。\n\n"
-            "**方式 2: 上传文件(推荐临时数据)**\n"
-            "选\"上传文件\"后,可拖入多种格式:\n"
-            "- CSV 分片 → 合并成整车数据\n"
-            "- Word(.doc/.docx) → 自动识别耐久 docx\n"
-            "- Excel(.xls/.xlsx) → 表格数据规范化"
-        )
 
     uploaded_files = None
     if use_builtin == "上传文件":
         uploaded_files = st.file_uploader(
-            "拖入 CSV / Word / Excel 文件(可多份,可混合)",
+            "拖入 CSV / Word / Excel 文件",
             type=["csv", "doc", "docx", "xls", "xlsx"],
             accept_multiple_files=True,
         )
@@ -433,19 +415,17 @@ with st.sidebar:
         help="仅影响「燃电运行看板」Tab;默认 mock 可独立演示",
     )
 
-    st.caption(f"内置数据路径: {DATA_ROOT}")
-
     st.divider()
 
     # ============================================================
-    # 📁 侧边栏: 分支文件结构（用户指定：从 Tab 移到左栏）
+    # 📁 侧边栏: 分支文件系统(用户指定: 放到侧边栏)
     # ============================================================
     from components.branch_ui import render_sidebar_file_structure
     render_sidebar_file_structure()
 
     st.divider()
 
-    # ✅ 侧边栏底部: DB 状态卡片 + 降级醒目警告
+    # ✅ 侧边栏: 已入库数据文件 (带删除/重命名)
     render_streamlit_db_status(st.sidebar)
 
 
@@ -454,7 +434,7 @@ with st.sidebar:
 import io  # 文件上传 BytesIO 处理
 
 data: dict[str, pd.DataFrame] = {}
-if use_builtin == "使用内置数据(自动扫描)":
+if use_builtin == "使用内置数据":
     data = load_default_csvs()
 
 

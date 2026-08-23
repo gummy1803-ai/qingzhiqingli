@@ -2488,9 +2488,10 @@ def render_streamlit_db_status(
                 total_rows = summary.get('total_rows', 0)
                 _st.caption(f"共 {total} 个文件, {total_rows:,} 行数据")
                 
-                # 显示最新10个文件
+                # 显示最新10个文件 (每行带操作: 删除 / 重命名)
                 recent_files = files[:10]
                 for f in recent_files:
+                    file_id = f.get('id', 0)
                     fname = f.get('filename', 'unknown')
                     vehicle = f.get('vehicle_id', '')
                     rows = f.get('row_count', 0)
@@ -2510,11 +2511,48 @@ def render_streamlit_db_status(
                     
                     kind = f.get('data_kind', '')
                     kind_icon = {'整车': '🚗', '耐久': '⚙️', '台架': '🔬'}.get(kind, '📄')
+                    safe_key = f"dsop_{file_id}"
                     
-                    if vehicle:
-                        _st.markdown(f"{kind_icon} **{fname}** | {vehicle} | {rows}行 | {time_str}")
-                    else:
-                        _st.markdown(f"{kind_icon} **{fname}** | {rows}行 | {time_str}")
+                    with _st.container(border=True):
+                        info_col, op_col = _st.columns([4, 1])
+                        with info_col:
+                            if vehicle:
+                                _st.markdown(f"{kind_icon} **{fname}** | {vehicle} | {rows}行 | {time_str}")
+                            else:
+                                _st.markdown(f"{kind_icon} **{fname}** | {rows}行 | {time_str}")
+                        with op_col:
+                            op = _st.selectbox(
+                                "操作", ["", "✏️重命名", "🗑️删除"],
+                                key=safe_key, label_visibility="collapsed"
+                            )
+                        
+                        if op == "✏️重命名":
+                            new_name = _st.text_input(
+                                "新文件名", value=fname,
+                                key=f"dsrn_{file_id}"
+                            )
+                            if _st.button("✅ 确认重命名", key=f"dsrnbtn_{file_id}", use_container_width=True):
+                                ok, msg = db_rename_data_file(file_id, new_name)
+                                if ok:
+                                    _st.success(msg)
+                                    _st.rerun()
+                                else:
+                                    _st.error(msg)
+                        
+                        elif op == "🗑️删除":
+                            confirm = _st.checkbox(
+                                f"确认删除 `{fname}`?",
+                                key=f"dsdelchk_{file_id}"
+                            )
+                            if _st.button("🗑️ 执行删除", key=f"dsdelbtn_{file_id}", 
+                                         type="primary", use_container_width=True,
+                                         disabled=not confirm):
+                                ok, msg = db_delete_data_file(file_id)
+                                if ok:
+                                    _st.success(msg)
+                                    _st.rerun()
+                                else:
+                                    _st.error(msg)
                 
                 if total > 10:
                     _st.caption(f"... 还有 {total-10} 个文件")

@@ -34,24 +34,23 @@ def render_branch_management_page():
         st.metric("文件总数", total_files)
     
     # 操作面板
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📋 分支列表", "📁 文件结构", "🔍 检测与校验", 
-        "🔀 分支对比", "📦 合并与冲突"
-    ])
-    
-    with tab1:
+    # NOTE: 原方案使用 st.tabs 嵌套 5 个子Tab，因主Tab本身就是 st.tabs 容器里的一项，
+    # 触发 Streamlit "Tab 内嵌 Tab" 限制，导致 metrics 之后内容全空白（静默崩溃）。
+    # 现改用 5 个 st.expander 分区：①兼容所有Streamlit版本  ②"� 文件结构"默认
+    # expanded=True，用户点主Tab一眼就能看到文件夹管理+每行4个文件操作按钮，无需二次点击子Tab。
+    with st.expander("📋 分支列表（创建/切换/重命名/删除）", expanded=False):
         _render_branch_list_tab(bm, branches, active_branch)
     
-    with tab2:
+    with st.expander("📁 文件结构（文件夹管理/文件预览/重命名/移动/删除）", expanded=True):
         _render_file_structure_tab(bm, active_branch)
     
-    with tab3:
+    with st.expander("🔍 检测与校验（重复检测/完整性校验）", expanded=False):
         _render_detection_tab(bm, active_branch)
     
-    with tab4:
+    with st.expander("🔀 分支对比（文件/指标差异）", expanded=False):
         _render_comparison_tab(bm, branches, active_branch)
     
-    with tab5:
+    with st.expander("📦 合并与冲突（分支合并/冲突解决）", expanded=False):
         _render_merge_tab(bm, branches, active_branch)
 
 
