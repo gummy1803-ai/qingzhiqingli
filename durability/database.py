@@ -138,7 +138,13 @@ _fallback_triggered = False
 
 # ---------- SQLAlchemy Engine ----------
 
-_SQLITE_PATH = _PROJECT_ROOT / "data" / "app.db"
+# Streamlit Cloud 持久化存储路径(应用重启不丢失)
+_STREAMLIT_CLOUD_ROOT = Path("/mount/src/qingzhiqingli")
+if _STREAMLIT_CLOUD_ROOT.exists():
+    _SQLITE_PATH = _STREAMLIT_CLOUD_ROOT / "data" / "app.db"
+    logger.info("[DB 存储] 检测到 Streamlit Cloud 环境, 使用持久化路径: %s", _SQLITE_PATH)
+else:
+    _SQLITE_PATH = _PROJECT_ROOT / "data" / "app.db"
 _metadata = MetaData()
 
 
