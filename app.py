@@ -1184,7 +1184,7 @@ if _recognized:
 # [核心功能区 1-4] 企业需求四大功能
 # [补充功能区 5-12] 原整车看板/耐久衰减/趋势预测等辅助功能
 # 顺序编号用于「一键跳转」按钮的 ASCII 箭头引导提示
-tab_fc, tab_perf, tab_insul, tab_bench, tab_overview, tab_dur, tab_forecast, tab_cmp, tab_report, tab_ai, tab_contacts, tab_history = st.tabs([
+tab_fc, tab_perf, tab_insul, tab_bench, tab_overview, tab_dur, tab_forecast, tab_cmp, tab_report, tab_ai, tab_contacts, tab_history, tab_branch = st.tabs([
     # 核心功能区(前4)
     "⚡ 燃电运行看板",     # 功能1: 燃电关键运行数据显示 (企业需求第1项)
     "📈 性能统计预测",     # 功能2: 燃电性能统计及预测 (企业需求第2项)
@@ -1199,6 +1199,7 @@ tab_fc, tab_perf, tab_insul, tab_bench, tab_overview, tab_dur, tab_forecast, tab
     "AI 助手",            # 系统:AI 智能解答(全产品)
     "📡 飞书人员对接",     # 系统:飞书预警联系人配置
     "📁 上传历史",         # 系统:上传历史记录及数据回看
+    "🌿 分支管理",         # 系统:文件分支管理与版本控制
 ])
 
 
@@ -2976,3 +2977,7 @@ with tab_contacts:                      # [11] 飞书预警联系人配置(系�
 
 with tab_history:                       # [12] 上传历史记录及数据回看(系统)
     _render_tab_history()
+
+with tab_branch:                        # [13] 文件分支管理与版本控制(系统)
+    from components.branch_ui import render_branch_management_page
+    render_branch_management_page()

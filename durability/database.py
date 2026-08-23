@@ -485,6 +485,93 @@ _bench_cycle_stats = Table(
     mysql_collate="utf8mb4_unicode_ci",
 )
 
+# ---------- Branch Management Tables ----------
+
+# 分支表: 存储分支信息
+_branches = Table(
+    "branches", _metadata,
+    Column("id", String(32), primary_key=True),
+    Column("name", String(128), nullable=False, unique=True),
+    Column("description", Text, default=""),
+    Column("is_active", Boolean, default=False),
+    Column("parent_branch_id", String(32), comment="来源分支ID,用于fork"),
+    Column("created_at", String(32), nullable=False),
+    Column("updated_at", String(32), nullable=False),
+    Column("file_count", Integer, default=0),
+    Column("total_size", Float(precision=53), default=0),
+    Index("ix_branches_name", "name"),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
+)
+
+# 文件快照表: 存储每个分支的文件状态
+_branch_file_snapshots = Table(
+    "branch_file_snapshots", _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("branch_id", String(32), nullable=False, index=True),
+    Column("file_path", String(1024), nullable=False),
+    Column("file_name", String(512), nullable=False),
+    Column("file_hash", String(64), nullable=False, index=True),
+    Column("file_size", Float(precision=53), default=0),
+    Column("file_type", String(32), default=""),
+    Column("data_kind", String(16), comment="整车/耐久/台架"),
+    Column("vehicle_id", String(32), default=""),
+    Column("is_valid", Boolean, default=True),
+    Column("status", String(16), default="new",
+           comment="new/modified/deleted/unchanged"),
+    Column("change_time", String(32)),
+    Column("metadata", _SQLA_JSON),
+    Index("ix_bfs_branch", "branch_id"),
+    Index("ix_bfs_hash", "file_hash"),
+    Index("ix_bfs_path", "file_path"),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
+)
+
+# 版本历史表: 记录分支的变更历史
+_branch_versions = Table(
+    "branch_versions", _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("branch_id", String(32), nullable=False, index=True),
+    Column("version_number", Integer, nullable=False),
+    Column("change_type", String(32),
+           comment="create/commit/merge/rename/delete"),
+    Column("change_summary", Text, default=""),
+    Column("changed_files", Integer, default=0),
+    Column("created_at", String(32), nullable=False),
+    Column("created_by", String(64), default="system"),
+    Index("ix_bv_branch", "branch_id"),
+    Index("ix_bv_version", "branch_id", "version_number"),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
+)
+
+# 合并冲突表: 记录合并时的冲突
+_merge_conflicts = Table(
+    "merge_conflicts", _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("source_branch_id", String(32), nullable=False, index=True),
+    Column("target_branch_id", String(32), nullable=False, index=True),
+    Column("file_path", String(1024), nullable=False),
+    Column("source_hash", String(64), nullable=False),
+    Column("target_hash", String(64), nullable=False),
+    Column("resolution", String(32), default="pending",
+           comment="pending/keep_source/keep_target/manual"),
+    Column("resolved_at", String(32)),
+    Column("resolved_by", String(64)),
+    Column("notes", Text, default=""),
+    Column("detected_at", String(32), nullable=False),
+    Index("ix_mc_source", "source_branch_id"),
+    Index("ix_mc_target", "target_branch_id"),
+    Index("ix_mc_resolution", "resolution"),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
+)
+
 
 # ---------- 初始化 ----------
 
