@@ -130,7 +130,7 @@ def _build_glitch_html(
     function drawLetters() {{
         const rect = canvas.getBoundingClientRect();
         ctx.clearRect(0, 0, rect.width, rect.height);
-        ctx.font = `${fontSize}px monospace`;
+        ctx.font = `${{fontSize}}px monospace`;
         ctx.textBaseline = 'top';
 
         letters.forEach((letter, index) => {{
