@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -400,31 +401,62 @@ def _hydrate_from_db(
     """
     dur_out = pd.DataFrame()
     bench_out: list[pd.DataFrame] = []
+    t0_all = time.perf_counter()
+    logger.info("[回填DB] ═══ 冷启动回填开始 ═══ 内置数据车辆数=%d (内置空时走DB)",
+                len(data_ref))
     try:
         # ---- 整车: data 空 就去 A2 按 vehicle_id 拉 ----
         if not data_ref:
             vlist = db_list_vehicles_in_db()
-            for item in vlist:
+            logger.info("[回填DB] 🚗 A2 侧边栏汇总返回 %d 辆车,开始逐车回拉明细", len(vlist))
+            for idx, item in enumerate(vlist, 1):
                 vid = str(item.get("vehicle_id") or "")
                 if not vid:
+                    logger.warning("[回填DB] 🚗 A2 第%d条记录 vehicle_id 为空,跳过: %s", idx, item)
                     continue
                 vdf = db_load_vehicle_minute(vid)
                 if len(vdf):
                     data_ref[vid] = vdf
+                    ts_from = vdf["Timestamp"].min().strftime("%Y-%m-%d %H:%M")
+                    ts_to = vdf["Timestamp"].max().strftime("%Y-%m-%d %H:%M")
+                    logger.info(
+                        "[回填DB] 🚗 A2[%d/%d] 车=%s 载入 %d 行 | %s ~ %s",
+                        idx, len(vlist), vid, len(vdf), ts_from, ts_to,
+                    )
+                else:
+                    logger.warning(
+                        "[回填DB] 🚗 A2[%d/%d] 车=%s 汇总行存在但明细表为空(脏数据?),跳过",
+                        idx, len(vlist), vid,
+                    )
             if data_ref:
-                logger.info("[回填DB] 整车 A2 载入 %d 车: %s",
+                logger.info("[回填DB] 🚗 A2 完成 载入 %d 车: %s",
                             len(data_ref), list(data_ref.keys()))
+            else:
+                logger.info("[回填DB] 🚗 A2 完成 无车辆数据(表为空或汇总明细不一致)")
+        else:
+            logger.info("[回填DB] 🚗 A2 跳过 使用内置扫描数据 %d 车,不覆盖", len(data_ref))
         # ---- 耐久: B1 拉中文列名宽表 ----
         dur_out = db_load_durability_stages()
         if len(dur_out):
-            logger.info("[回填DB] 耐久 B1 载入 %d 条工步", len(dur_out))
+            file_set = dur_out["file"].dropna().unique().tolist() if "file" in dur_out.columns else []
+            logger.info("[回填DB] 📉 B1 完成 载入 %d 条工步,来源文件=%d 个:%s",
+                        len(dur_out), len(file_set), file_set[:5])
+        else:
+            logger.info("[回填DB] 📉 B1 完成 无耐久工步数据")
         # ---- 台架: C1 拉回 aggregate 格式 df ----
         bench_agg = db_load_bench_cycle_stats()
         if len(bench_agg):
             bench_out = [bench_agg]
-            logger.info("[回填DB] 台架 C1 载入 %d 行 (cycle×功率点)", len(bench_agg))
+            cycles = sorted(bench_agg["cycle_id"].astype(int).unique().tolist())
+            rigs = bench_agg.get("rig_id", pd.Series(dtype=str)).dropna().unique().tolist() if "rig_id" in bench_agg.columns else []
+            logger.info("[回填DB] 🔬 C1 完成 载入 %d 行 (cycle×功率点),cycle=%s,台架=%s",
+                        len(bench_agg), cycles[:6], rigs)
+        else:
+            logger.info("[回填DB] 🔬 C1 完成 无台架循环数据")
+        logger.info("[回填DB] ═══ 冷启动回填完成 ═══ 总耗时=%.1fms",
+                    (time.perf_counter() - t0_all) * 1000)
     except Exception as ex:
-        logger.warning("[回填DB] 部分失败(不阻塞主流程): %s", ex, exc_info=True)
+        logger.error("[回填DB] ═══ 回填失败(不阻塞UI) ═══ err=%s", ex, exc_info=True)
     return dur_out, bench_out
 
 
@@ -464,22 +496,38 @@ def _is_bench_dataframe(df: pd.DataFrame) -> tuple[bool, list[str]]:
 
 if uploaded_files:
     import tempfile
+    import hashlib
+    t_up_start = time.perf_counter()
+    logger.info(
+        "[上传预检] ═══ 文件上传开始 ═══ 本次共 %d 个文件: %s",
+        len(uploaded_files), [f.name for f in uploaded_files],
+    )
     # ── 原始文件字节缓存(用于计算 file_hash 去重 + A1 落库) ──
     _veh_raw_bytes: dict[str, bytes] = {}   # file_name → bytes
     _docx_raw_bytes: list[tuple[str, bytes, pd.DataFrame]] = []  # (file_name, bytes, tmp_df)
     _bench_raw_bytes: list[tuple[str, bytes, pd.DataFrame]] = []  # (file_name, bytes, raw_df)
 
-    for f in uploaded_files:
+    for f_idx, f in enumerate(uploaded_files, 1):
         suffix = Path(f.name).suffix.lower()
+        logger.info("[上传预检] [%d/%d] 处理 %s | suffix=%s | size≈%s bytes",
+                    f_idx, len(uploaded_files), f.name, suffix,
+                    "(未知-Seekable未读)" if hasattr(f, "size") else "(StreamlitUploadedFile)")
         try:
             # ------------------------------------------------------------
             # ✅ 规则 1: .docx → 100% 耐久工步(走标准解析,不做任何关键词判断)
             # ------------------------------------------------------------
             if suffix in (".doc", ".docx"):
                 if suffix == ".doc":
+                    logger.warning("[上传预检] [%d/%d] 跳过 .doc 旧版格式: %s",
+                                   f_idx, len(uploaded_files), f.name)
                     st.warning(f"{f.name}: 旧版 .doc 格式不受支持,请另存为 .docx 后再上传")
                     continue
                 f_bytes = f.read()
+                f_hash = hashlib.sha256(f_bytes).hexdigest()[:12]
+                logger.info(
+                    "[上传预检] [%d/%d] 📉 耐久(docx规则) size=%d byte | sha256=%s… 开始load_durability_docx",
+                    f_idx, len(uploaded_files), len(f_bytes), f_hash,
+                )
                 with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
                     tmp.write(f_bytes)
                     tmp_path = tmp.name
@@ -489,7 +537,17 @@ if uploaded_files:
                         tmp_df["file"] = f.name
                         docx_parts.append(tmp_df)
                         _docx_raw_bytes.append((f.name, f_bytes, tmp_df))
+                        logger.info(
+                            "[上传预检] [%d/%d] 📉 耐久解析成功 rows=%d cols=%d | 列名(前8)=%s",
+                            f_idx, len(uploaded_files), len(tmp_df), len(tmp_df.columns),
+                            list(tmp_df.columns)[:8],
+                        )
                         st.info(f"{f.name}: 📉 **耐久工步数据** (.docx 按规则直接归入) → 「耐久衰减」Tab")
+                    else:
+                        logger.warning(
+                            "[上传预检] [%d/%d] 📉 耐久解析后为空表(0 rows),可能 docx 内无工步表格: %s",
+                            f_idx, len(uploaded_files), f.name,
+                        )
                 finally:
                     try:
                         Path(tmp_path).unlink(missing_ok=True)
@@ -507,28 +565,60 @@ if uploaded_files:
                 f_bytes = f.read()
                 df = pd.read_excel(io.BytesIO(f_bytes))
             else:
+                logger.warning("[上传预检] [%d/%d] 跳过不支持的格式: %s (suffix=%s)",
+                               f_idx, len(uploaded_files), f.name, suffix)
                 st.warning(f"{f.name}: 不支持的格式 ({suffix})")
                 continue
 
+            f_hash = hashlib.sha256(f_bytes).hexdigest()[:12]
+            logger.info(
+                "[上传预检] [%d/%d] CSV/Excel解析完成 rows=%d cols=%d size=%dB sha256=%s… 列名(前10)=%s",
+                f_idx, len(uploaded_files), len(df), len(df.columns),
+                len(f_bytes), f_hash, list(df.columns)[:10],
+            )
+
             if "Timestamp" in df.columns:
                 # ----- 有 Timestamp → 整车数据 -----
+                ts_before = len(df)
                 df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+                ts_invalid = df["Timestamp"].isna().sum()
+                ts_min = df["Timestamp"].min()
+                ts_max = df["Timestamp"].max()
                 if suffix == ".csv":
                     csv_parts.append(df)
                 else:
                     xls_parts.append(df)
                 _veh_raw_bytes[f.name] = f_bytes
+                logger.info(
+                    "[上传预检] [%d/%d] 🚗 整车(Timestamp命中) 无效Timestamp=%d/%d "
+                    "时间=%s ~ %s → 入整车分片缓存(%s)",
+                    f_idx, len(uploaded_files), int(ts_invalid), ts_before,
+                    ts_min, ts_max, "csv" if suffix == ".csv" else "xlsx",
+                )
                 st.info(f"{f.name}: 🚗 **整车数据** (检测到 Timestamp 列) → 整车看板/燃电/性能等 8 个 Tab")
             else:
                 # ----- 无 Timestamp → 仅判断台架循环(耐久不可能是 CSV/Excel) -----
                 _is_bench, _hits = _is_bench_dataframe(df)
+                logger.info(
+                    "[上传预检] [%d/%d] 🔍 无Timestamp,台架关键词判断: is_bench=%s hits=%s",
+                    f_idx, len(uploaded_files), _is_bench, _hits,
+                )
                 if _is_bench:
                     if "file" not in df.columns:
                         df["file"] = f.name
                     bench_parts.append(df)
                     _bench_raw_bytes.append((f.name, f_bytes, df))
+                    logger.info(
+                        "[上传预检] [%d/%d] 🏭 台架(关键词命中) rows=%d → 入台架缓存",
+                        f_idx, len(uploaded_files), len(df),
+                    )
                     st.info(f"{f.name}: 🏭 **台架循环数据** (命中台架关键词 {_hits}) → 「🔬 台架耐久统计及预警」Tab")
                 else:
+                    logger.warning(
+                        "[上传预检] [%d/%d] ❌ 无法归类: 无Timestamp 且 台架关键词<2个。"
+                        "实际列名=%s",
+                        f_idx, len(uploaded_files), list(df.columns)[:12],
+                    )
                     st.warning(
                         f"{f.name}: ❌ 无法归类\n\n"
                         f"三大数据类型规则:\n"
@@ -538,9 +628,19 @@ if uploaded_files:
                     )
         except Exception as e:
             tip = " (旧版 .doc 格式不受支持,请另存为 .docx 后再上传)" if suffix == ".doc" else ""
+            logger.error(
+                "[上传预检] [%d/%d] ❌ 文件解析异常 name=%s suffix=%s err=%s",
+                f_idx, len(uploaded_files), f.name, suffix, e, exc_info=True,
+            )
             st.warning(f"{f.name} 解析失败{tip}: {e}")
-            logger.warning("上传文件解析失败 %s: %s", f.name, e, exc_info=True)
 
+    logger.info(
+        "[上传预检] ═══ 分类完成 ═══ 耗时=%.1fs | 整车(csv=%d+xls=%d)=%d 分片 | "
+        "耐久docx=%d 份 | 台架循环=%d 份",
+        time.perf_counter() - t_up_start,
+        len(csv_parts), len(xls_parts), len(csv_parts) + len(xls_parts),
+        len(_docx_raw_bytes), len(_bench_raw_bytes),
+    )
     # ✅ 台架循环行总数 → 存到 session_state,让顶部识别卡片能看到(跨模块跨 rerun 共享)
     if bench_parts:
         st.session_state["_bench_parts"] = bench_parts
@@ -558,7 +658,11 @@ if uploaded_files:
     # ---------- 整车 ----------
     all_csv_parts = csv_parts + xls_parts
     if all_csv_parts:
+        t_p0 = time.perf_counter()
+        logger.info("[落库] 🚗 整车 A1+A2 开始: 分片数=%d", len(all_csv_parts))
+        before_rows = sum(len(p) for p in all_csv_parts)
         merged = pd.concat(all_csv_parts, ignore_index=True)
+        dup_removed = len(merged) - len(merged.drop_duplicates(subset=["Timestamp"], keep="first"))
         merged = merged.drop_duplicates(subset=["Timestamp"], keep="first")
         merged = merged.sort_values("Timestamp").reset_index(drop=True)
         meta = (parse_csv_filename(uploaded_files[0].name)
@@ -566,6 +670,11 @@ if uploaded_files:
                 else {"vehicle": "上传"})
         vehicle_id = str(meta.get("vehicle") or "上传")
         data[vehicle_id] = merged
+        logger.info(
+            "[落库] 🚗 整车合并完成: 原始行数=%d → 去重后=%d (Timestamp重复删除=%d) "
+            "车辆ID=%s 文件名元数据=%s",
+            before_rows, len(merged), int(dup_removed), vehicle_id, meta,
+        )
         # A1 + A2 落库
         try:
             # 用"合并后字节集"的哈希去重(顺序拼接 _veh_raw_bytes 所有 value)
@@ -579,6 +688,11 @@ if uploaded_files:
                       if len(ts_min_pd) else None)
             numeric_cols = [c for c in merged.columns
                             if c != "Timestamp" and pd.api.types.is_numeric_dtype(merged[c])]
+            logger.info(
+                "[落库] 🚗 A1 upsert 入参: concat_bytes=%dByte 数值列=%d "
+                "信号列(前10)=%s 时间范围=%s~%s",
+                len(concat_bytes), len(numeric_cols), numeric_cols[:10], ts_min, ts_max,
+            )
             fid, inserted, fhash = db_upsert_data_file(
                 "整车",
                 file_name="+".join(sorted(_veh_raw_bytes.keys())) or f"{vehicle_id}-merged",
@@ -590,9 +704,15 @@ if uploaded_files:
                 col_signals=numeric_cols,
                 status="uploaded",
             )
+            logger.info(
+                "[落库] 🚗 A1 upsert 返回: fid=%s inserted=%s hash=%s… (新文件才继续A2聚合写入)",
+                fid, inserted, fhash[:12],
+            )
             if inserted:
                 agg_cnt = db_write_vehicle_minute(vehicle_id, merged, file_id=fid)
                 # A1 状态回写
+                logger.info("[落库] 🚗 A2 聚合完成 分钟桶=%d → 回写A1状态: uploaded→aggregated",
+                            int(agg_cnt))
                 db_upsert_data_file(
                     "整车",
                     file_name="+".join(sorted(_veh_raw_bytes.keys())) or f"{vehicle_id}-merged",
@@ -610,8 +730,12 @@ if uploaded_files:
             else:
                 _db_st_msgs.append(
                     f"🚗 整车(车 {vehicle_id})内容未变(hash 已存在),跳过重复入库")
+            logger.info(
+                "[落库] 🚗 整车 A1+A2 完成 | 耗时=%.1fs | msg=%s",
+                time.perf_counter() - t_p0, _db_st_msgs[-1],
+            )
         except Exception as ex:
-            logger.warning("[落库] 整车失败 vehicle=%s: %s", vehicle_id, ex, exc_info=True)
+            logger.error("[落库] ❌ 整车失败 vehicle=%s err=%s", vehicle_id, ex, exc_info=True)
             _db_st_msgs.append(f"🚗 整车落库失败(不影响查看): {ex}")
 
         # 数据质量扫描 + 邮件报警(发现高危时)
@@ -652,31 +776,55 @@ if uploaded_files:
 
     # ---------- 耐久工步(docx): B1 + A1 ----------
     if docx_parts:
+        t_b0 = time.perf_counter()
         try:
             all_docx_df = pd.concat(docx_parts, ignore_index=True)
-            for (name, fbytes, _tdf) in _docx_raw_bytes:
+            logger.info(
+                "[落库] 📉 耐久工步 A1+B1 开始: docx=%d 份 总工步=%d 行",
+                len(_docx_raw_bytes), len(all_docx_df),
+            )
+            for bi, (name, fbytes, _tdf) in enumerate(_docx_raw_bytes, 1):
                 # sample_name: docx 解析不到单独的样品列, 用文件名 stem(去扩展名)
                 sample_n = Path(name).stem
+                logger.info(
+                    "[落库] 📉 耐久[%d/%d] A1 upsert name=%s bytes=%d rows=%d sample=%s",
+                    bi, len(_docx_raw_bytes), name, len(fbytes), len(_tdf), sample_n,
+                )
                 fid, inserted, _fh = db_upsert_data_file(
                     "耐久工步", name, file_bytes=fbytes,
                     row_count=int(len(_tdf)),
                     extra_meta={"sample": sample_n},
                     status="uploaded",
                 )
+                logger.info(
+                    "[落库] 📉 耐久[%d/%d] A1 返回 fid=%s inserted=%s hash=%s…",
+                    bi, len(_docx_raw_bytes), fid, inserted, _fh[:12],
+                )
                 if inserted:
                     wcnt = db_write_durability_stages(
                         _tdf, file_id=fid, sample_name=sample_n, raw_file_name=name)
+                    logger.info(
+                        "[落库] 📉 耐久[%d/%d] B1 写入=%d行 → 回写A1状态 uploaded→aggregated",
+                        bi, len(_docx_raw_bytes), int(wcnt),
+                    )
                     db_upsert_data_file(
                         "耐久工步", name, file_hash=_fh,
                         row_count=int(len(_tdf)),
                         extra_meta={"sample": sample_n},
                         status="aggregated", agg_rows=int(wcnt),
                     )
+                else:
+                    logger.info(
+                        "[落库] 📉 耐久[%d/%d] hash已存在(已入库过),跳过 B1 重复写入",
+                        bi, len(_docx_raw_bytes),
+                    )
             if _docx_raw_bytes:
-                _db_st_msgs.append(
-                    f"📉 耐久工步已持久化: {len(all_docx_df):,} 条工步 × {len(_docx_raw_bytes)} 个 docx")
+                msg = f"📉 耐久工步已持久化: {len(all_docx_df):,} 条工步 × {len(_docx_raw_bytes)} 个 docx"
+                _db_st_msgs.append(msg)
+                logger.info("[落库] 📉 耐久工步 A1+B1 完成 | 耗时=%.1fs | %s",
+                            time.perf_counter() - t_b0, msg)
         except Exception as ex:
-            logger.warning("[落库] 耐久工步失败: %s", ex, exc_info=True)
+            logger.error("[落库] ❌ 耐久工步失败 err=%s", ex, exc_info=True)
             _db_st_msgs.append(f"📉 耐久工步落库失败(不影响查看): {ex}")
 
     # ---------- 台架循环(无 Timestamp CSV/Excel): C1 + A1 ----------
@@ -684,6 +832,7 @@ if uploaded_files:
         from durability.data_parser import parse_durability_data
         from durability.statistics_aggregator import aggregate_durability_stats
 
+        t_c0 = time.perf_counter()
         try:
             # 每个上传文件独立解析 + 聚合 + 落 C1(便于 rig_id 区分)
             _BENCH_SIG_COPY: list[str] = [
@@ -691,15 +840,41 @@ if uploaded_files:
                 "FC_LFR", "FC_HFR",
                 "FC_CurrOut", "FC_VoltOut", "FC_NetPwrOut", "FC_MinCellVoltage",
             ]
+            logger.info(
+                "[落库] 🔬 台架循环 A1+C1 开始: 文件=%d 份 聚合信号=%s",
+                len(_bench_raw_bytes), _BENCH_SIG_COPY,
+            )
             _total_c1_rows = 0
-            for (name, fbytes, raw_df) in _bench_raw_bytes:
+            for ci, (name, fbytes, raw_df) in enumerate(_bench_raw_bytes, 1):
                 rig_n = f"上传::{Path(name).stem}"
+                cycles_before = (int(raw_df["cycle_id"].fillna(-1).nunique())
+                                 if "cycle_id" in raw_df.columns else 0)
+                logger.info(
+                    "[落库] 🔬 台架[%d/%d] 开始 name=%s bytes=%d raw_rows=%d cycle数≈%d rig=%s",
+                    ci, len(_bench_raw_bytes), name, len(fbytes),
+                    len(raw_df), cycles_before, rig_n,
+                )
                 parsed = parse_durability_data(raw_df)
                 if len(parsed) == 0:
+                    logger.warning("[落库] 🔬 台架[%d/%d] parse_durability_data 返回空,跳过",
+                                   ci, len(_bench_raw_bytes))
                     continue
+                logger.info(
+                    "[落库] 🔬 台架[%d/%d] parse后 rows=%d cols=%d | 列名(前8)=%s",
+                    ci, len(_bench_raw_bytes), len(parsed), len(parsed.columns),
+                    list(parsed.columns)[:8],
+                )
                 agg_df = aggregate_durability_stats(parsed, _BENCH_SIG_COPY)
                 if len(agg_df) == 0:
+                    logger.warning("[落库] 🔬 台架[%d/%d] aggregate返回空(没有cycle×功率点?),跳过",
+                                   ci, len(_bench_raw_bytes))
                     continue
+                cycles_uniq = sorted(agg_df["cycle_id"].astype(int).unique().tolist())
+                pps_uniq = sorted(agg_df["power_point"].astype(float).unique().tolist())
+                logger.info(
+                    "[落库] 🔬 台架[%d/%d] 聚合完成 rows=%d cycle=%s 功率点=%s → 开始A1 upsert",
+                    ci, len(_bench_raw_bytes), len(agg_df), cycles_uniq[:6], pps_uniq[:6],
+                )
                 fid, inserted, _fh = db_upsert_data_file(
                     "台架循环", name, file_bytes=fbytes,
                     row_count=int(len(raw_df)),
@@ -708,21 +883,43 @@ if uploaded_files:
                                 if "cycle_id" in parsed.columns else 0},
                     status="uploaded",
                 )
-                wcnt, _ = db_write_bench_cycle_stats(
+                logger.info(
+                    "[落库] 🔬 台架[%d/%d] A1 返回 fid=%s inserted=%s hash=%s…",
+                    ci, len(_bench_raw_bytes), fid, inserted, _fh[:12],
+                )
+                wcnt, c1_ids = db_write_bench_cycle_stats(
                     agg_df, file_id=fid, rig_id=rig_n, source_file_name=name)
                 _total_c1_rows += int(wcnt)
+                logger.info(
+                    "[落库] 🔬 台架[%d/%d] C1 写入/更新=%d ids_count=%d",
+                    ci, len(_bench_raw_bytes), int(wcnt), len(c1_ids),
+                )
                 if inserted:
+                    logger.info(
+                        "[落库] 🔬 台架[%d/%d] 新文件 → 回写A1状态 uploaded→aggregated agg_rows=%d",
+                        ci, len(_bench_raw_bytes), int(wcnt),
+                    )
                     db_upsert_data_file(
                         "台架循环", name, file_hash=_fh,
                         row_count=int(len(raw_df)),
                         extra_meta={"rig": rig_n},
                         status="aggregated", agg_rows=int(wcnt),
                     )
+                else:
+                    logger.info(
+                        "[落库] 🔬 台架[%d/%d] hash已存在,A1 inserted=False → C1已做upsert合并(OK)",
+                        ci, len(_bench_raw_bytes),
+                    )
             if _bench_raw_bytes:
-                _db_st_msgs.append(
-                    f"🏭 台架循环已持久化: {_total_c1_rows} 行循环×功率点聚合 × {len(_bench_raw_bytes)} 份文件")
+                msg = (f"🏭 台架循环已持久化: {_total_c1_rows} 行循环×功率点聚合 "
+                       f"× {len(_bench_raw_bytes)} 份文件")
+                _db_st_msgs.append(msg)
+                logger.info(
+                    "[落库] 🔬 台架循环 A1+C1 完成 | 耗时=%.1fs | %s",
+                    time.perf_counter() - t_c0, msg,
+                )
         except Exception as ex:
-            logger.warning("[落库] 台架循环失败: %s", ex, exc_info=True)
+            logger.error("[落库] ❌ 台架循环失败 err=%s", ex, exc_info=True)
             _db_st_msgs.append(f"🏭 台架循环落库失败(不影响查看): {ex}")
 
     # ── 所有落库消息合并成一条 toast/info(不打断主流程) ──

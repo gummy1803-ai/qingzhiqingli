@@ -596,6 +596,12 @@ def _apply_schema_migrations(engine) -> None:
     """对每一条迁移规则:先查该列是否存在,不存在就 ADD COLUMN。"""
     if len(_SCHEMA_MIGRATIONS) == 0:
         return
+    t0 = time.perf_counter()
+    _applied = 0
+    _skipped = 0
+    _failed = 0
+    logger.info("[DB 迁移] 开始 检查 %d 条 schema 迁移规则 | backend=%s",
+                len(_SCHEMA_MIGRATIONS), engine.dialect.name)
     try:
         insp = engine.dialect.has_table  # type: ignore[attr-defined]
     except Exception:
@@ -603,15 +609,17 @@ def _apply_schema_migrations(engine) -> None:
     import sqlalchemy as _sa
     with engine.connect() as conn:
         for table_name, col_name, col_obj in _SCHEMA_MIGRATIONS:
+            rule_key = f"{table_name}.{col_name}"
             try:
                 # 跨后端统一方法: insp.get_columns
                 cols = _sa.inspect(conn).get_columns(table_name)
                 if any(c["name"] == col_name for c in cols):
-                    logger.debug("[迁移] 列 %s.%s 已存在,跳过", table_name, col_name)
+                    logger.debug("[DB 迁移] ↻ 列 %s 已存在,跳过", rule_key)
+                    _skipped += 1
                     continue
             except Exception as _e:
-                logger.warning("[迁移] 探测列 %s.%s 失败: %s (尝试直接 ALTER)",
-                               table_name, col_name, _e)
+                logger.warning("[DB 迁移] ⚠ 探测列 %s 失败: %s (尝试直接 ALTER)",
+                               rule_key, _e)
             # 拼接 DDL: 用 compile 方式拿后端兼容的 ADD COLUMN 子句
             try:
                 ddl = str(
@@ -622,17 +630,30 @@ def _apply_schema_migrations(engine) -> None:
                 # 兜底手动拼
                 type_str = "INTEGER"  # 目前唯一的迁移列 bench_cycle_id 就是 INTEGER
                 ddl = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {type_str}"
-            logger.info("[迁移] 补列(跨后端 DDL): %s", ddl.strip())
+            logger.info("[DB 迁移] → 补列 DDL: %s", ddl.strip())
             try:
                 conn.execute(text(ddl))
                 conn.commit()
+                _applied += 1
+                logger.info("[DB 迁移] ✅ 列 %s 补列成功", rule_key)
             except Exception as al_ex:
                 # SQLite/MySQL 有时候 "duplicate column" 也会抛, 属于安全忽略
-                logger.info("[迁移] 补列 DDL 执行结果: %s (重复列可忽略)", al_ex)
+                al_str = str(al_ex).lower()
+                if "duplicate" in al_str or "already exists" in al_str:
+                    logger.info("[DB 迁移] ↻ 列 %s 已存在(DDL报重复,安全忽略)", rule_key)
+                    _skipped += 1
+                else:
+                    _failed += 1
+                    logger.error("[DB 迁移] ❌ 列 %s 补列失败: %s", rule_key, al_ex)
                 try:
                     conn.rollback()
                 except Exception:
                     pass
+    logger.info(
+        "[DB 迁移] 完成 总规则=%d 新应用=%d 跳过=%d 失败=%d | 耗时=%.1fms",
+        len(_SCHEMA_MIGRATIONS), _applied, _skipped, _failed,
+        (time.perf_counter() - t0) * 1000,
+    )
 
 
 def _rows_to_list(rows) -> List[Dict[str, Any]]:
@@ -1168,9 +1189,15 @@ def db_count_data_files(kind: Optional[str] = None) -> int:
             stmt = stmt.where(_vehicle_data_files.c.data_kind == kind)
         with _engine.connect() as conn:
             return conn.execute(stmt).scalar() or 0
+    t0 = time.perf_counter()
     try:
-        return _run_with_fallback("db_count_data_files", _do)
-    except Exception:
+        n = _run_with_fallback("db_count_data_files", _do)
+        logger.info("[落库A1] 📊 文件目录统计 kind=%s count=%d | 耗时=%.1fms",
+                    kind or "(全部)", n, (time.perf_counter() - t0) * 1000)
+        return int(n)
+    except Exception as e:
+        logger.warning("[落库A1] 📊 文件目录统计失败 kind=%s err=%s",
+                       kind or "(全部)", e)
         return 0
 
 
@@ -1256,6 +1283,8 @@ def db_write_vehicle_minute(
 
     def _do() -> int:
         inserted_rows = 0
+        updated_rows = 0
+        conflict_batches = 0
         with _engine.connect() as conn:
             # SQLite/MySQL: 按批次 + 唯一键冲突忽略(INSERT OR IGNORE / INSERT IGNORE)
             # 为了兼容两种后端,这里改用"逐行 ORM upsert by 联合唯一键"太慢 → 分批次 insert,
@@ -1263,14 +1292,21 @@ def db_write_vehicle_minute(
             from sqlalchemy import select
             from sqlalchemy.exc import IntegrityError
             BATCH = 300
+            total_batches = (len(rows) + BATCH - 1) // BATCH
+            logger.info("[落库A2] 写入批次 总桶=%d 批次=%d 每批≤%d (按车+分钟唯一键去重)",
+                        len(rows), total_batches, BATCH)
             for i in range(0, len(rows), BATCH):
                 batch = rows[i:i + BATCH]
+                batch_no = i // BATCH + 1
                 try:
                     conn.execute(_vehicle_minute_samples.insert(), batch)
                     inserted_rows += len(batch)
                 except IntegrityError:
                     # 命中唯一键(同车同分钟),退回逐行处理
+                    conflict_batches += 1
                     conn.rollback()
+                    batch_ins = 0
+                    batch_upd = 0
                     for r in batch:
                         sel = conn.execute(
                             select(_vehicle_minute_samples).where(
@@ -1281,6 +1317,7 @@ def db_write_vehicle_minute(
                         if sel is None:
                             conn.execute(_vehicle_minute_samples.insert().values(**r))
                             inserted_rows += 1
+                            batch_ins += 1
                         elif upsert:
                             upd = {k: v for k, v in r.items()
                                    if k not in ("vehicle_id", "minute_ts") and v is not None}
@@ -1291,8 +1328,17 @@ def db_write_vehicle_minute(
                                         _vehicle_minute_samples.c.minute_ts == r["minute_ts"],
                                     ).values(**upd)
                                 )
+                                updated_rows += 1
+                                batch_upd += 1
+                    logger.debug(
+                        "[落库A2] 批次#%02d/%d 冲突降级: batch_rows=%d → 新插入=%d 更新=%d",
+                        batch_no, total_batches, len(batch), batch_ins, batch_upd)
             conn.commit()
-        return inserted_rows
+        logger.info(
+            "[落库A2] 写入批次完成 总桶=%d 新插入=%d 更新=%d 冲突降级批次=%d/%d",
+            len(rows), inserted_rows, updated_rows, conflict_batches, total_batches,
+        )
+        return inserted_rows + updated_rows
 
     t0 = time.perf_counter()
     try:
@@ -1338,10 +1384,28 @@ def db_load_vehicle_minute(
         df = df.dropna(subset=["Timestamp"])
         return df.reset_index(drop=True)
 
+    t0 = time.perf_counter()
     try:
-        return _run_with_fallback("db_load_vehicle_minute", _do)
+        df = _run_with_fallback("db_load_vehicle_minute", _do)
+        if len(df):
+            ts_min = df["Timestamp"].min()
+            ts_max = df["Timestamp"].max()
+            dur_h = (ts_max - ts_min).total_seconds() / 3600.0 if len(df) > 1 else 0.0
+            cols_present = [c for c in _VEHICLE_MINUTE_COLS if c in df.columns]
+            logger.info(
+                "[落库A2] ⬇ 回拉 vehicle=%s rows=%d cols(企业)=%d/%d "
+                "时间范围=%s ~ %s (跨度≈%.1fh) | 耗时=%.1fms",
+                vehicle_id, len(df), len(cols_present), len(_VEHICLE_MINUTE_COLS),
+                ts_min.strftime("%Y-%m-%d %H:%M"),
+                ts_max.strftime("%Y-%m-%d %H:%M"),
+                dur_h, (time.perf_counter() - t0) * 1000,
+            )
+        else:
+            logger.info("[落库A2] ⬇ 回拉 vehicle=%s 无数据(空表) | 耗时=%.1fms",
+                        vehicle_id, (time.perf_counter() - t0) * 1000)
+        return df
     except Exception as e:
-        logger.warning("db_load_vehicle_minute vehicle=%s 失败: %s", vehicle_id, e)
+        logger.warning("[落库A2] ⬇ 回拉 vehicle=%s 失败 err=%s", vehicle_id, e, exc_info=True)
         return pd.DataFrame()
 
 
@@ -1361,10 +1425,18 @@ def db_list_vehicles_in_db() -> List[Dict[str, Any]]:
             rows = conn.execute(stmt).fetchall()
         return [dict(r._mapping) for r in rows]
 
+    t0 = time.perf_counter()
     try:
-        return _run_with_fallback("db_list_vehicles_in_db", _do)
+        out = _run_with_fallback("db_list_vehicles_in_db", _do)
+        total_buckets = sum(int(x.get("n_buckets") or 0) for x in out)
+        ids = [str(x.get("vehicle_id")) for x in out]
+        logger.info(
+            "[落库A2] 🚗 侧边栏车列表 车辆=%d 总分钟桶=%d 车ID=%s | 耗时=%.1fms",
+            len(out), total_buckets, ids, (time.perf_counter() - t0) * 1000,
+        )
+        return out
     except Exception as e:
-        logger.warning("db_list_vehicles_in_db 失败: %s", e)
+        logger.warning("[落库A2] 🚗 侧边栏车列表查询失败 err=%s", e, exc_info=True)
         return []
 
 
@@ -1430,8 +1502,11 @@ def db_write_durability_stages(
     def _do() -> int:
         from sqlalchemy import select
         from sqlalchemy.exc import IntegrityError
-        written = 0
+        new_ins = 0
+        new_upd = 0
         with _engine.connect() as conn:
+            logger.info("[落库B1] 开始逐行 upsert 共 %d 行 (去重键: file_id/stage+step_idx)",
+                        len(rows))
             for r in rows:
                 # 构造联合唯一条件:file_id 有就用,没有就退 (sample_name+stage+step_idx)
                 if r.get("file_id"):
@@ -1446,7 +1521,7 @@ def db_write_durability_stages(
                 if exist is None:
                     try:
                         conn.execute(_durability_stages.insert().values(**r))
-                        written += 1
+                        new_ins += 1
                     except IntegrityError:
                         pass  # 并发场景跳过
                 else:
@@ -1456,9 +1531,11 @@ def db_write_durability_stages(
                     if upd:
                         conn.execute(
                             _durability_stages.update().where(*conds).values(**upd))
-                        written += 1
+                        new_upd += 1
             conn.commit()
-        return written
+        logger.info("[落库B1] 逐行 upsert 完成 新插入=%d 更新=%d 合计=%d",
+                    new_ins, new_upd, new_ins + new_upd)
+        return new_ins + new_upd
 
     try:
         cnt = _run_with_fallback("db_write_durability_stages", _do)
@@ -1506,10 +1583,28 @@ def db_load_durability_stages(sample_name: Optional[str] = None) -> pd.DataFrame
         df = pd.DataFrame(out_cols)
         return df.reset_index(drop=True)
 
+    t0 = time.perf_counter()
     try:
-        return _run_with_fallback("db_load_durability_stages", _do)
+        df = _run_with_fallback("db_load_durability_stages", _do)
+        if len(df):
+            samples = df["file"].dropna().unique().tolist() if "file" in df.columns else []
+            stages = df["stage"].dropna().unique().tolist() if "stage" in df.columns else []
+            logger.info(
+                "[落库B1] ⬇ 耐久回拉 rows=%d 样品(文件)=%d stage=%s "
+                "时间列_stage_start_h_min=%s_max=%s | 耗时=%.1fms",
+                len(df), len(samples), stages[:3],
+                df["stage_start_h"].min() if "stage_start_h" in df.columns else "N/A",
+                df["stage_start_h"].max() if "stage_start_h" in df.columns else "N/A",
+                (time.perf_counter() - t0) * 1000,
+            )
+            if samples:
+                logger.debug("[落库B1] 耐久文件列表: %s", samples[:8])
+        else:
+            logger.info("[落库B1] ⬇ 耐久回拉 空表(B1无数据) | 耗时=%.1fms",
+                        (time.perf_counter() - t0) * 1000)
+        return df
     except Exception as e:
-        logger.warning("db_load_durability_stages 失败: %s", e)
+        logger.warning("[落库B1] ⬇ 耐久回拉失败 err=%s", e, exc_info=True)
         return pd.DataFrame()
 
 
@@ -1578,9 +1673,13 @@ def db_write_bench_cycle_stats(
 
     def _do() -> Tuple[int, List[int]]:
         from sqlalchemy import select
-        written = 0
+        new_ins = 0
+        new_upd = 0
         ids: List[int] = []
         with _engine.connect() as conn:
+            logger.info(
+                "[落库C1] 开始逐行 upsert 共 %d 行 (去重键: rig_id+cycle_id+power_point)",
+                len(rows))
             for r in rows:
                 conds = [_bench_cycle_stats.c.rig_id == r["rig_id"],
                          _bench_cycle_stats.c.cycle_id == r["cycle_id"],
@@ -1596,7 +1695,7 @@ def db_write_bench_cycle_stats(
                             new_id = dict(exist2._mapping).get("id")
                     if new_id is not None:
                         ids.append(int(new_id))
-                    written += 1
+                    new_ins += 1
                 else:
                     exist_d = dict(exist._mapping)
                     ids.append(int(exist_d.get("id")))
@@ -1605,9 +1704,11 @@ def db_write_bench_cycle_stats(
                     if upd:
                         conn.execute(
                             _bench_cycle_stats.update().where(*conds).values(**upd))
-                        written += 1
+                        new_upd += 1
             conn.commit()
-        return written, ids
+        logger.info("[落库C1] 逐行 upsert 完成 新插入=%d 更新=%d 合计=%d ids_count=%d",
+                    new_ins, new_upd, new_ins + new_upd, len(ids))
+        return new_ins + new_upd, ids
 
     try:
         cnt, ids = _run_with_fallback("db_write_bench_cycle_stats", _do)
@@ -1661,10 +1762,35 @@ def db_load_bench_cycle_stats(
                 out[f"{sig}_std"] = tmp[col]
         return out.reset_index(drop=True)
 
+    t0 = time.perf_counter()
     try:
-        return _run_with_fallback("db_load_bench_cycle_stats", _do)
+        df = _run_with_fallback("db_load_bench_cycle_stats", _do)
+        if len(df):
+            c_min = int(df["cycle_id"].min())
+            c_max = int(df["cycle_id"].max())
+            pp_count = df["power_point"].nunique()
+            sig_cols_present = [c for c in list(_BENCH_MEAN_COL_MAP.values())
+                                if c.replace("_mean", "_mean") in df.columns]
+            logger.info(
+                "[落库C1] ⬇ 台架回拉 rows=%d cycle范围=%d~%d 功率点=%d "
+                "filter(rig=%s,cycle_%s~%s) 聚合信号列=%d/%d | 耗时=%.1fms",
+                len(df), c_min, c_max, pp_count,
+                rig_id or "(全部)",
+                cycle_from if cycle_from is not None else "-∞",
+                cycle_to if cycle_to is not None else "+∞",
+                len(sig_cols_present), len(_BENCH_MEAN_COL_MAP),
+                (time.perf_counter() - t0) * 1000,
+            )
+        else:
+            logger.info(
+                "[落库C1] ⬇ 台架回拉 空表(C1无数据) filter(rig=%s,cycle_%s~%s) | 耗时=%.1fms",
+                rig_id or "(全部)",
+                cycle_from if cycle_from is not None else "-∞",
+                cycle_to if cycle_to is not None else "+∞",
+                (time.perf_counter() - t0) * 1000)
+        return df
     except Exception as e:
-        logger.warning("db_load_bench_cycle_stats 失败: %s", e)
+        logger.warning("[落库C1] ⬇ 台架回拉失败 err=%s", e, exc_info=True)
         return pd.DataFrame()
 
 
