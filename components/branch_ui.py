@@ -140,45 +140,166 @@ def _render_branch_list_tab(bm: BranchManager, branches: list, active_branch: st
 
 def _render_file_structure_tab(bm: BranchManager, active_branch: str):
     """渲染文件结构标签页。"""
+    import logging as _ulgg
+    _logger = _ulgg.getLogger(__name__)
+
     st.subheader(f"📁 分支文件结构: `{active_branch}`")
-    
-    # 添加文件区
-    with st.expander("📤 上传文件到分支", expanded=False):
-        uploaded_file = st.file_uploader(
-            "选择要添加的文件",
-            accept_multiple_files=True,
-            key="branch_file_upload"
+
+    # ------ 一致性状态条（DB快照 vs 文件系统）------
+    try:
+        from durability.database import db_get_branch_snapshot_status  # 延迟导入
+        snap = db_get_branch_snapshot_status(active_branch)
+        if snap and snap.get("ok"):
+            by_st = snap.get("by_status", {}) or {}
+            status_colors = {
+                "new": ("🆕 新文件", "🟢"),
+                "unchanged": ("✅ 未变", "🔵"),
+                "modified": ("✏️ 修改", "🟡"),
+                "deleted": ("🗑️ 已删", "🔴"),
+            }
+            badges = []
+            total_size = snap.get("total_size", 0) or 0
+            for s, (label, _icon) in status_colors.items():
+                if by_st.get(s, 0):
+                    badges.append(f"{by_st[s]} {label}")
+            st.caption(
+                f"🔗 DB一致性快照 | 已注册 {snap.get('total', 0)} 个文件, "
+                f"总大小 {_format_size(total_size)} | "
+                + (" | ".join(badges) if badges else "暂无快照记录（上传文件后自动写入）")
+            )
+    except Exception as _snap_err:
+        st.caption(f"🔗 DB快照暂不可用（首次导入时自动同步）: {str(_snap_err)[:40]}")
+
+    # ------ 文件夹管理面板 ------
+    with st.expander("📂 文件夹管理（新建/删除/重命名）", expanded=False):
+        folders = bm.list_folders(active_branch)
+        folder_paths = [""] + [f["path"] for f in folders]
+        if folders:
+            st.markdown(f"**当前文件夹（共 {len(folders)} 个）**")
+            df_folders = pd.DataFrame([{
+                "📁 路径": f["path"], "父目录": f["parent"] or "/(根)",
+                "📄 文件数": f["file_count"], "总大小": _format_size(f["size"]),
+            } for f in folders])
+            st.dataframe(df_folders, use_container_width=True, hide_index=True, height=160)
+        else:
+            st.info("暂无文件夹（导入带子路径的文件时会自动创建）")
+
+        fm_col1, fm_col2, fm_col3 = st.columns(3)
+        with fm_col1:
+            st.markdown("**➕ 新建文件夹**")
+            new_folder = st.text_input("新文件夹路径（可多级: raw/车212/第一批）",
+                                       key="new_folder_input", placeholder="例如: raw/车212")
+            if st.button("✅ 确认新建", key="create_folder_btn", use_container_width=True):
+                _logger.info("[UI-文件夹创建] 点击确认: branch=%s, path=%s", active_branch, new_folder)
+                ok, msg = bm.create_folder(active_branch, new_folder)
+                if ok:
+                    st.success(msg); st.rerun()
+                else:
+                    st.error(msg)
+
+        with fm_col2:
+            st.markdown("**✏️ 重命名文件夹**")
+            old_folder = st.selectbox("选择旧路径", folder_paths,
+                                      key="rename_folder_old",
+                                      format_func=lambda x: "(根)" if x == "" else x)
+            new_folder_name = st.text_input("新路径", key="rename_folder_new",
+                                            placeholder="例如: raw/车212_v2")
+            if st.button("✅ 确认重命名", key="rename_folder_btn",
+                         use_container_width=True, disabled=(not old_folder)):
+                _logger.info("[UI-文件夹重命名] 点击确认: branch=%s, old=%s, new=%s",
+                             active_branch, old_folder, new_folder_name)
+                ok, msg = bm.rename_folder(active_branch, old_folder, new_folder_name)
+                if ok:
+                    st.success(msg); st.rerun()
+                else:
+                    st.error(msg)
+
+        with fm_col3:
+            st.markdown("**🗑️ 删除文件夹**")
+            del_folder = st.selectbox("选择要删除的文件夹", folder_paths,
+                                      key="delete_folder_sel",
+                                      format_func=lambda x: "(根)" if x == "" else x)
+            force_folder = st.checkbox("强制删除（文件夹非空也删）", key="force_folder_del")
+            if st.button("🗑️ 执行删除", key="delete_folder_btn", type="primary",
+                         use_container_width=True, disabled=(not del_folder)):
+                _logger.info("[UI-文件夹删除] 点击确认: branch=%s, path=%s, force=%s",
+                             active_branch, del_folder, force_folder)
+                ok, msg = bm.delete_folder(active_branch, del_folder, force=force_folder)
+                if ok:
+                    st.success(msg); st.rerun()
+                else:
+                    st.error(msg)
+
+    # ------ 上传文件（支持选目标文件夹） ------
+    with st.expander("📤 上传文件到分支（支持指定文件夹）", expanded=True):
+        folders = bm.list_folders(active_branch)
+        folder_options = [("（根目录·直接上传）", "")] + [
+            (f"📁 {f['path']} ({f['file_count']}个文件)", f["path"]) for f in folders
+        ]
+        display_map = {label: value for label, value in folder_options}
+        tgt_label = st.selectbox(
+            "导入到哪个文件夹？",
+            options=[label for label, _ in folder_options],
+            key="upload_target_folder_sel",
+            help="选择'（根目录）'直接放在分支下; 也可以先在上面面板新建 raw/车212 这样的子目录"
         )
-        
+        target_folder_norm = display_map.get(tgt_label, "")
+        st.caption(f"→ 最终存放位置: `.branches/{active_branch}/{target_folder_norm or '<根>'}/`")
+
+        uploaded_file = st.file_uploader(
+            "选择要添加的文件（CSV / DOCX / XLSX 会自动解析并写入数据库）",
+            accept_multiple_files=True,
+            key="branch_file_upload_v2",
+        )
+
         if uploaded_file:
+            any_success = False
             for file in uploaded_file:
                 content = file.read()
-                success, msg, _ = bm.add_file(
+                # 统一用 add_file_to_folder: 会同步写 branch_file_snapshots + vehicle_data_files
+                success, msg, _ = bm.add_file_to_folder(
                     active_branch,
-                    file.name,
-                    content
+                    file_path=file.name,
+                    file_content=content,
+                    target_folder=target_folder_norm,
+                    upload_user=st.session_state.get("_user_hint", "ui_streamlit"),
                 )
                 if success:
+                    any_success = True
                     st.success(f"✅ {msg}")
                 else:
                     st.error(f"❌ {msg}")
-            st.rerun()
-    
-    # 文件列表
+            if any_success:
+                st.rerun()
+
+    # ------ 文件列表 + 操作按钮（每行：预览 / 移动 / 删除） ------
     files = bm.list_branch_files(active_branch)
-    
+
     if files:
         # 统计信息
         total_size = sum(f["size"] for f in files)
         valid_count = sum(1 for f in files if f["is_valid"])
         invalid_count = sum(1 for f in files if not f["is_valid"])
-        
+
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("文件总数", len(files))
         col2.metric("文件总大小", _format_size(total_size))
         col3.metric("有效文件", valid_count)
         col4.metric("损坏文件", invalid_count)
-        
+
+        # 按文件夹分组, 方便用户选择过滤
+        all_parents = sorted({
+            str(Path(f["path"]).parent).replace("\\", "/")
+            for f in files
+        })
+        all_parents = [p for p in all_parents if p != "."]
+        scope = ["📂 全部文件"] + [f"📁 {p}" for p in all_parents]
+        scope_sel = st.selectbox("按文件夹筛选:", scope, key="scope_filter")
+        if scope_sel != scope[0]:
+            parent_need = scope_sel.replace("📁 ", "")
+            files = [f for f in files
+                     if str(Path(f["path"]).parent).replace("\\", "/") == parent_need]
+
         # 文件表格
         df = pd.DataFrame([{
             "📁 路径": f["path"],
@@ -188,68 +309,138 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
             "🔐 哈希": f["hash"][:16] + "...",
             "📅 修改时间": f["modified"][:19]
         } for f in files])
-        
-        st.dataframe(df, use_container_width=True, hide_index=True, height=300)
-        
-        # 文件操作
-        with st.expander("✏️ 重命名文件", expanded=False):
-            file_to_rename = st.selectbox(
-                "选择要重命名的文件",
-                options=[f["path"] for f in files],
-                key="file_rename_select",
-                help="支持修改文件名，或用 'subdir/newname.ext' 移动到同级子目录"
-            )
-            default_ext = Path(file_to_rename).suffix if file_to_rename else ""
-            default_stem = Path(file_to_rename).stem if file_to_rename else ""
-            new_name_val = st.text_input(
-                "新名字（含扩展名）",
-                value=file_to_rename if file_to_rename else "",
-                key="file_rename_new_name",
-                placeholder=f"例如: 新文件名{default_ext}  或  subdir/新文件名{default_ext}"
-            )
-            col_a, col_b = st.columns([1, 1])
-            with col_a:
-                if st.button("✅ 确认重命名", type="primary", key="confirm_rename_file_btn", use_container_width=True):
-                    if not new_name_val or new_name_val.strip() == "":
-                        st.error("请输入新文件名")
-                    else:
-                        import logging as _lgg
-                        _ulgg = _lgg.getLogger(__name__)
-                        _ulgg.info("[UI-文件重命名] 用户点击确认: branch=%s, old=%s, new=%s",
-                                    active_branch, file_to_rename, new_name_val)
-                        success, msg = bm.rename_file(active_branch, file_to_rename, new_name_val.strip())
-                        if success:
-                            st.success(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
-            with col_b:
-                if st.button("↩️ 还原成原名", key="reset_rename_name_btn", use_container_width=True):
-                    st.info(f"已还原为: `{file_to_rename}`")
-                    st.rerun()
 
-        with st.expander("🗑️ 删除文件", expanded=False):
-            file_to_delete = st.selectbox(
-                "选择要删除的文件",
-                options=[f["path"] for f in files],
-                key="file_delete_select"
-            )
-            col_c, col_d = st.columns([1, 1])
-            with col_c:
-                confirm_del = st.checkbox(f"⚠️ 确认删除 `{file_to_delete}`？此操作不可恢复", key="confirm_delete_checkbox")
-            with col_d:
-                if st.button("🗑️ 执行删除", type="primary", key="delete_file_btn",
-                             use_container_width=True, disabled=not confirm_del):
-                    import logging as _lgg2
-                    _ulgg2 = _lgg2.getLogger(__name__)
-                    _ulgg2.info("[UI-文件删除] 用户点击确认删除: branch=%s, file=%s",
-                                active_branch, file_to_delete)
-                    success, msg = bm.remove_file(active_branch, file_to_delete)
-                    if success:
-                        st.success(msg)
-                        st.rerun()
+        st.dataframe(df, use_container_width=True, hide_index=True, height=240)
+
+        # ===== 动作面板: 预览 / 移动 / 重命名 / 删除 =====
+        st.markdown("### 🛠️ 文件操作（单文件）")
+        path_options = [f["path"] for f in files]
+        if not path_options:
+            st.info("当前筛选条件下无文件")
+            return
+
+        act_tab1, act_tab2, act_tab3, act_tab4 = st.tabs([
+            "👁️ 打开预览", "➡️ 移动位置", "✏️ 重命名", "🗑️ 删除",
+        ])
+
+        # -- Tab A: 预览 --
+        with act_tab1:
+            prev_sel = st.selectbox("选择要预览的文件", path_options, key="preview_sel")
+            if st.button("👁️ 打开预览", key="do_preview", use_container_width=True):
+                _logger.info("[UI-文件预览] 点击: branch=%s, path=%s", active_branch, prev_sel)
+                with st.spinner("正在读取文件..."):
+                    res = bm.open_file_preview(active_branch, prev_sel, max_rows=200)
+                if not res.get("ok"):
+                    st.error(res.get("error") or "预览失败")
+                else:
+                    kind = res.get("kind", "binary")
+                    size = res.get("size", 0)
+                    st.info(f"📦 文件类型: **{kind.upper()}** | 大小: {_format_size(size)} | "
+                            f"行数: {res.get('rows', 0)} | 列数: {res.get('cols', 0)}")
+                    if res.get("kind") in ("csv", "excel"):
+                        st.dataframe(res.get("dataframe"), use_container_width=True,
+                                     height=400, hide_index=False)
+                    elif res.get("kind") == "docx":
+                        if res.get("dataframe") is not None:
+                            st.markdown("#### 表格内容（取首张表前100行）")
+                            st.dataframe(res.get("dataframe"), use_container_width=True, height=400)
+                        if res.get("text"):
+                            with st.expander(f"文档正文（前200段）", expanded=False):
+                                st.text(res.get("text"))
+                    elif res.get("kind") == "image":
+                        try:
+                            st.image(res.get("raw_path"), caption=prev_sel)
+                        except Exception:
+                            st.info("图片类型请下载后本地打开查看")
+                    elif res.get("kind") == "text":
+                        st.text_area("文本内容", value=res.get("text", ""), height=400)
+                    else:
+                        with open(res.get("raw_path"), "rb") as fh:
+                            st.download_button("⬇️ 下载此二进制文件",
+                                               data=fh.read(), file_name=Path(prev_sel).name)
+                    # 也给一个"数据一键跳到上传历史"按钮
+                    st.caption("提示: 如果是业务 CSV/DOCX/XLSX，已自动同步到 [📁 上传历史] Tab 查看")
+
+        # -- Tab B: 移动（跨目录） --
+        with act_tab2:
+            move_src = st.selectbox("选择要移动的文件", path_options, key="move_src_sel")
+            move_folder_opts = ["（根目录）"] + [f["path"] for f in folders]
+            move_tgt_label = st.selectbox("移动到哪个文件夹？", move_folder_opts, key="move_tgt_folder")
+            move_tgt_folder = "" if move_tgt_label == "（根目录）" else move_tgt_label
+            # 目标文件名：默认不变,可改
+            move_new_name = st.text_input("新文件名（不改就留空）",
+                                          value=Path(move_src).name, key="move_new_name")
+            if Path(move_new_name).name != move_new_name:
+                st.warning("⚠️ 新文件名不能带路径，用上方'移动到哪个文件夹'选择目录")
+            combined_new = (Path(move_tgt_folder) / Path(move_new_name).name).as_posix() \
+                if move_tgt_folder else Path(move_new_name).name
+            st.caption(f"最终目标: `.branches/{active_branch}/{combined_new}`")
+            if st.button("➡️ 执行移动", key="do_move", type="primary", use_container_width=True):
+                if move_src == combined_new:
+                    st.info("源与目标路径相同，跳过")
+                else:
+                    _logger.info("[UI-文件移动] 点击确认: branch=%s, src=%s, dst=%s",
+                                 active_branch, move_src, combined_new)
+                    ok, msg = bm.move_file(active_branch, move_src, combined_new)
+                    if ok:
+                        st.success(msg); st.rerun()
                     else:
                         st.error(msg)
+
+        # -- Tab C: 重命名文件（已存在·优化版） --
+        with act_tab3:
+            file_to_rename = st.selectbox(
+                "选择要重命名的文件",
+                options=path_options,
+                key="file_rename_select_v2",
+            )
+            default_ext = Path(file_to_rename).suffix if file_to_rename else ""
+            new_name_val = st.text_input(
+                "新名字（含扩展名）",
+                value=Path(file_to_rename).name if file_to_rename else "",
+                key="file_rename_new_name_v2",
+                help="只改文件名（保持同目录）；要换目录请用 '➡️ 移动位置' Tab"
+            )
+            # 拼接成相对路径（保持原目录）
+            src_parent = str(Path(file_to_rename).parent).replace("\\", "/") if file_to_rename else ""
+            if src_parent == ".":
+                src_parent = ""
+            combined_rename = (Path(src_parent) / new_name_val).as_posix() if src_parent else new_name_val
+            if st.button("✅ 确认重命名", type="primary",
+                         key="confirm_rename_file_btn_v2", use_container_width=True,
+                         disabled=(not file_to_rename)):
+                if not new_name_val or new_name_val.strip() == "":
+                    st.error("请输入新文件名")
+                elif Path(new_name_val).name != new_name_val.strip():
+                    st.error("新名字不能包含路径，移动目录请用 '➡️ 移动位置' Tab")
+                else:
+                    _logger.info("[UI-文件重命名] 点击确认: branch=%s, old=%s, new=%s",
+                                active_branch, file_to_rename, combined_rename)
+                    success, msg = bm.rename_file(active_branch, file_to_rename, combined_rename)
+                    if success:
+                        st.success(msg); st.rerun()
+                    else:
+                        st.error(msg)
+
+        # -- Tab D: 删除文件（已存在·加二次确认） --
+        with act_tab4:
+            file_to_delete = st.selectbox(
+                "选择要删除的文件",
+                options=path_options,
+                key="file_delete_select_v2"
+            )
+            confirm_del = st.checkbox(
+                f"⚠️ 确认删除 `{file_to_delete}`？此操作不可恢复（.branches 物理删除 + DB快照同步标记为已删除）",
+                key="confirm_delete_checkbox_v2")
+            if st.button("🗑️ 执行删除", type="primary", key="delete_file_btn_v2",
+                         use_container_width=True, disabled=(not confirm_del or not file_to_delete)):
+                _logger.info("[UI-文件删除] 点击确认删除: branch=%s, file=%s",
+                            active_branch, file_to_delete)
+                success, msg = bm.remove_file(active_branch, file_to_delete)
+                if success:
+                    st.success(msg); st.rerun()
+                else:
+                    st.error(msg)
     else:
         st.info("📂 此分支为空，请上传文件")
 
@@ -543,3 +734,206 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024):.1f} MB"
     else:
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+# ====================================================================
+# 侧边栏专用：分支文件结构（紧凑单列，适配 ~300px 侧边栏宽）
+# ====================================================================
+
+def render_sidebar_file_structure():
+    """侧边栏版的文件结构面板。
+
+    设计原则（参考侧边栏布局安全经验）:
+    1. 全部单列流式布局，不用 columns 多列或固定高度/绝对定位，避免破坏侧边栏 DOM 流
+    2. 只暴露核心操作：切分支 → 新建文件夹 → 上传到指定目录 → 文件列表+快捷操作
+    3. 详细编辑（文件夹重命名/文件移动预览）仍跳转完整 Tab 进行
+    """
+    import logging as _lgg
+    _logger = _lgg.getLogger(__name__)
+    bm = get_branch_manager()
+    branches = bm.list_branches()
+    names = [b["name"] for b in branches]
+    active = bm.get_active_branch()
+    if active not in names and names:
+        active = names[0]
+
+    # ---- 标题 ----
+    st.markdown("""
+    <div style="padding: 2px 0 6px 0; border-bottom: 1px solid rgba(0,212,255,0.12); margin-bottom: 10px;">
+        <div style="font-size: 0.95rem; font-weight: 700; color: #00D4FF;">📁 分支文件结构</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ---- 1. 分支切换 ----
+    try:
+        idx_cur = names.index(active)
+    except ValueError:
+        idx_cur = 0
+    new_sel = st.selectbox("当前分支", options=names, index=idx_cur,
+                           key="sidebar_branch_sel", label_visibility="visible")
+    if new_sel and new_sel != active:
+        ok, msg = bm.switch_branch(new_sel)
+        if ok:
+            st.success(f"已切换至 `{new_sel}`"); st.rerun()
+        else:
+            st.error(msg)
+    active = new_sel or active
+
+    # ---- 2. 新建文件夹（单行压缩） ----
+    with st.expander("➕ 新建 / 管理文件夹", expanded=False):
+        new_fp = st.text_input("新文件夹路径 (可多级)", key="sb_new_fp",
+                               placeholder="例: raw/车212/第一批", label_visibility="collapsed")
+        if st.button("✅ 新建文件夹", key="sb_mkdir_btn", use_container_width=True):
+            if not new_fp:
+                st.warning("路径不能为空")
+            else:
+                _logger.info("[侧边栏-新建文件夹] branch=%s, path=%s", active, new_fp)
+                ok, msg = bm.create_folder(active, new_fp)
+                if ok:
+                    st.success(msg); st.rerun()
+                else:
+                    st.error(msg)
+
+        st.caption("重命名/删除文件夹: 请打开「🌿 分支管理」→「📁 文件结构」")
+
+    # ---- 3. 上传文件到指定目录 ----
+    with st.expander("📤 上传文件到分支", expanded=True):
+        folders = bm.list_folders(active)
+        folder_opts = [("（根目录）", "")] + [(f"📁 {f['path']}", f["path"]) for f in folders]
+        display_map = {label: value for label, value in folder_opts}
+        tgt_lbl = st.selectbox("目标文件夹", options=[x[0] for x in folder_opts],
+                               key="sb_upload_target", label_visibility="visible")
+        target_folder_norm = display_map.get(tgt_lbl, "")
+        st.caption(f"位置: `.branches/{active}/{target_folder_norm or '<根>'}`")
+
+        uploaded = st.file_uploader(
+            "选择文件",
+            accept_multiple_files=True,
+            key="sb_upload_files",
+            label_visibility="collapsed",
+        )
+        if uploaded:
+            any_ok = False
+            for f in uploaded:
+                ok, msg, _h = bm.add_file_to_folder(
+                    active,
+                    file_path=f.name,
+                    file_content=f.read(),
+                    target_folder=target_folder_norm,
+                    upload_user="sidebar_ui",
+                )
+                if ok:
+                    any_ok = True
+                    st.success(f"✅ {Path(f.name).name}")
+                else:
+                    st.error(f"❌ {Path(f.name).name}: {msg}")
+            if any_ok:
+                st.rerun()
+
+    # ---- 4. 文件列表（紧凑） ----
+    files = bm.list_branch_files(active)
+    total_kb = sum(f["size"] for f in files) // 1024
+    st.caption(f"共 {len(files)} 个文件 · 约 {total_kb} KB")
+
+    if files:
+        # 按目录过滤
+        parents = sorted({
+            str(Path(f["path"]).parent).replace("\\", "/")
+            for f in files
+        })
+        parents = [p for p in parents if p != "."]
+        filter_options = ["📂 全部"] + [f"📁 {p}" for p in parents]
+        sel_scope = st.selectbox("按目录筛选", options=filter_options,
+                                 key="sb_file_scope", label_visibility="visible")
+        if sel_scope != "📂 全部":
+            need = sel_scope.replace("📁 ", "")
+            files = [f for f in files
+                     if str(Path(f["path"]).parent).replace("\\", "/") == need]
+
+        # 预览文件总数截断，防止侧边栏过长 (最多 40 条)
+        truncated = files[:40]
+        if len(files) > len(truncated):
+            st.caption(f"仅显示前 {len(truncated)} 个，完整列表请到「🌿 分支管理」Tab")
+
+        for f in truncated:
+            path = f["path"]
+            size_s = _format_size(f["size"])
+            valid_s = "✅" if f["is_valid"] else "⚠️"
+            with st.container():
+                r1, r2 = st.columns([4, 1])
+                with r1:
+                    st.markdown(
+                        f"<div style='font-size:0.78rem; word-break:break-all;'>"
+                        f"{valid_s} {path}</div>"
+                        f"<div style='font-size:0.68rem;color:#6B7894;'>{size_s} · "
+                        f"修改 {f['modified'][:16].replace('T',' ')}</div>",
+                        unsafe_allow_html=True,
+                    )
+                with r2:
+                    op = st.selectbox(
+                        "操作", ["", "👁️预览", "✏️重命名", "🗑️删除"],
+                        key=f"sb_op_{f['hash'][:12]}",
+                        label_visibility="collapsed",
+                    )
+                if op == "👁️预览":
+                    _logger.info("[侧边栏-预览] branch=%s, path=%s", active, path)
+                    with st.spinner("读取中..."):
+                        prev = bm.open_file_preview(active, path, max_rows=50)
+                    if not prev.get("ok"):
+                        st.error(prev.get("error") or "预览失败")
+                    else:
+                        kind = prev.get("kind", "")
+                        with st.expander(f"预览 · {Path(path).name} ({kind.upper()})", expanded=False):
+                            if prev.get("dataframe") is not None:
+                                st.dataframe(prev["dataframe"], use_container_width=True, height=220)
+                            elif prev.get("kind") == "image":
+                                try:
+                                    st.image(prev.get("raw_path"))
+                                except Exception:
+                                    st.info("图片类型需本地打开")
+                            elif prev.get("text"):
+                                st.text(prev["text"][:3000])
+                            else:
+                                try:
+                                    with open(prev.get("raw_path"), "rb") as fh:
+                                        st.download_button("⬇️ 下载", data=fh.read(),
+                                                           file_name=Path(path).name,
+                                                           key=f"sb_dl_{f['hash'][:10]}")
+                                except Exception as dl_e:
+                                    st.error(str(dl_e))
+                elif op == "✏️重命名":
+                    cur_parent = str(Path(path).parent).replace("\\", "/")
+                    if cur_parent == ".":
+                        cur_parent = ""
+                    new_name = st.text_input("新文件名(带扩展名)", value=Path(path).name,
+                                             key=f"sb_rn_{f['hash'][:12]}")
+                    if st.button("✅ 确认重命名", key=f"sb_rnbtn_{f['hash'][:12]}",
+                                 use_container_width=True):
+                        combined = (Path(cur_parent) / new_name).as_posix() if cur_parent else new_name
+                        if Path(new_name).name != new_name:
+                            st.error("不能包含路径")
+                        else:
+                            _logger.info("[侧边栏-重命名] branch=%s, old=%s, new=%s",
+                                         active, path, combined)
+                            ok, msg = bm.rename_file(active, path, combined)
+                            if ok:
+                                st.success(msg); st.rerun()
+                            else:
+                                st.error(msg)
+                elif op == "🗑️删除":
+                    confirm = st.checkbox(f"确认删除 `{Path(path).name}`?",
+                                          key=f"sb_delchk_{f['hash'][:12]}")
+                    if st.button("🗑️ 执行删除", key=f"sb_delbtn_{f['hash'][:12]}",
+                                 type="primary", use_container_width=True, disabled=not confirm):
+                        _logger.info("[侧边栏-删除] branch=%s, path=%s", active, path)
+                        ok, msg = bm.remove_file(active, path)
+                        if ok:
+                            st.success(msg); st.rerun()
+                        else:
+                            st.error(msg)
+                st.divider() if False else None  # placeholder (保持代码可扩展)
+    else:
+        st.info("📭 分支为空，先上传文件。")
+
+    st.caption("更多功能(文件夹重命名/移动文件/一致性校验): 打开 Tab → 🌿 分支管理 → 📁 文件结构")
+

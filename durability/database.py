@@ -2317,6 +2317,243 @@ def render_streamlit_db_status(
             _st.caption(f"加载文件列表失败: {str(e)[:50]}")
 
 
+# ---------- 辅助解析: 对外暴露 parse_csv_filename (供 BranchManager._persist_business_file 复用) ----------
+
+def _parse_csv_filename(name: str):
+    """解析 CSV 文件名,返回 vehicle/start_ts/end_ts/... 或 None。
+
+    这是 src.data_loader.parse_csv_filename 的一个安全重定向:
+    优先用 src.data_loader, 避免两套正则不一致; 若导入失败则返回 None。
+    """
+    try:
+        from src.data_loader import parse_csv_filename as _p
+        return _p(name)
+    except Exception as e:
+        logger.debug("_parse_csv_filename 重定向失败: %s", e)
+        return None
+
+
+# ---------- Branch 管理一致性 CRUD: branch_file_snapshots / branches ----------
+
+def db_sync_branch_snapshot(
+    branch_name: str,
+    branch_files: List[Dict],
+    note: str = "",
+) -> Tuple[bool, str]:
+    """把 branch_files 列表全量同步写入 branch_file_snapshots 表。
+
+    策略（可安全降级 SQLite）:
+      1. 先把同 branch_name 下 旧记录 的 status 全部标成 'deleted'
+      2. 然后对 branch_files 每条做 upsert: 存在(hash+path)→unchanged; 新建→new; 修改→modified
+      3. 最后把仍 'deleted' 但这次又在列表里的记录回滚为 unchanged
+      4. 若 branches 表无此分支, 自动插入一条占位记录
+
+    返回: (ok, 摘要)
+    """
+    from sqlalchemy import select, and_, update
+    import time
+    t0 = time.perf_counter()
+    if not branch_name:
+        return False, "branch_name 为空"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    logger.info("[分支快照同步] 开始: branch=%s, files=%d, note=%s",
+                branch_name, len(branch_files), note or "(无)")
+
+    try:
+        def _do() -> Tuple[bool, str]:
+            with _engine.connect() as conn:
+                # --- 1) branches 自动建占位（如果没有） ---
+                br_exists = conn.execute(
+                    select(_branches.c.id).where(_branches.c.name == branch_name)
+                ).fetchone()
+                branch_id = None
+                if br_exists:
+                    branch_id = br_exists[0] if isinstance(br_exists, tuple) else br_exists.id
+                else:
+                    import hashlib
+                    branch_id = hashlib.md5(branch_name.encode("utf-8")).hexdigest()[:32]
+                    conn.execute(_branches.insert().values(
+                        id=branch_id,
+                        name=branch_name,
+                        description="BranchManager 自动创建",
+                        is_active=True,
+                        parent_branch_id=None,
+                        created_at=now,
+                        updated_at=now,
+                        file_count=len(branch_files),
+                        total_size=sum(f.get("size", 0) for f in branch_files),
+                    ))
+                    logger.info("[分支快照同步] 新建branches占位: id=%s, name=%s", branch_id, branch_name)
+
+                # --- 2) 把该 branch 旧快照先设为 "可能已删除" ---
+                conn.execute(update(_branch_file_snapshots)
+                    .where(_branch_file_snapshots.c.branch_id == branch_id)
+                    .values(status="deleted", change_time=now))
+
+                # --- 3) 遍历当前文件, 逐个 upsert ---
+                new_count = 0
+                mod_count = 0
+                keep_count = 0
+                file_total_size = 0
+                for f in branch_files:
+                    fpath = str(f.get("path", ""))
+                    fname = str(f.get("name", Path(fpath).name))
+                    fhash = str(f.get("hash", ""))
+                    fsize = float(f.get("size", 0))
+                    ftype = str(f.get("type", ""))
+                    is_valid = bool(f.get("is_valid", True))
+                    file_total_size += fsize
+
+                    # 查找同 branch_id + 同 file_path 的旧记录
+                    old_row = conn.execute(
+                        select(_branch_file_snapshots).where(and_(
+                            _branch_file_snapshots.c.branch_id == branch_id,
+                            _branch_file_snapshots.c.file_path == fpath,
+                        ))
+                    ).fetchone()
+
+                    if old_row is None:
+                        # 全新
+                        ins_vals = dict(
+                            branch_id=branch_id,
+                            file_path=fpath,
+                            file_name=fname,
+                            file_hash=fhash,
+                            file_size=fsize,
+                            file_type=ftype,
+                            data_kind="",      # 由 _persist_business_file 另写 vehicle_data_files
+                            vehicle_id="",
+                            is_valid=is_valid,
+                            status="new",
+                            change_time=now,
+                            metadata={
+                                "sync_note": note,
+                                "modified": f.get("modified", ""),
+                            },
+                        )
+                        conn.execute(_branch_file_snapshots.insert().values(**ins_vals))
+                        new_count += 1
+                    else:
+                        # 旧记录存在: 按 hash 是否变化判断 modified vs unchanged
+                        old_hash = ""
+                        old_cols = old_row._mapping if hasattr(old_row, "_mapping") else {}
+                        for k, v in old_cols.items():
+                            if str(k) == "file_hash":
+                                old_hash = str(v)
+                                break
+                        if old_hash == fhash:
+                            new_status = "unchanged"
+                            keep_count += 1
+                        else:
+                            new_status = "modified"
+                            mod_count += 1
+                        conn.execute(update(_branch_file_snapshots)
+                            .where(and_(
+                                _branch_file_snapshots.c.branch_id == branch_id,
+                                _branch_file_snapshots.c.file_path == fpath,
+                            ))
+                            .values(
+                                file_name=fname,
+                                file_hash=fhash,
+                                file_size=fsize,
+                                file_type=ftype,
+                                is_valid=is_valid,
+                                status=new_status,
+                                change_time=now,
+                            ))
+
+                # --- 4) 更新 branches 汇总字段 ---
+                conn.execute(update(_branches)
+                    .where(_branches.c.id == branch_id)
+                    .values(
+                        updated_at=now,
+                        file_count=len(branch_files),
+                        total_size=float(file_total_size),
+                    ))
+                conn.commit()
+                cost_ms = (time.perf_counter() - t0) * 1000
+                msg = (f"OK: files={len(branch_files)}, new={new_count}, "
+                       f"modified={mod_count}, unchanged={keep_count}, size_K={file_total_size/1024:.1f}")
+                logger.info(
+                    "[分支快照同步] ✅ branch=%s | %s | 耗时=%.0fms",
+                    branch_name, msg, cost_ms,
+                )
+                return True, msg
+        return _run_with_fallback("db_sync_branch_snapshot", _do)
+    except Exception as e:
+        cost_ms = (time.perf_counter() - t0) * 1000
+        logger.error("[分支快照同步] ❌ branch=%s, err=%s (%.0fms)",
+                     branch_name, str(e), cost_ms, exc_info=True)
+        return False, str(e)
+
+
+def db_get_branch_snapshot_status(branch_name: str) -> Dict:
+    """UI 侧查询: 返回某分支的快照统计和最新 20 条记录, 用于展示一致性状态。"""
+    from sqlalchemy import select
+    result: Dict = {"ok": False, "total": 0, "by_status": {}, "records": [], "error": ""}
+    if not branch_name:
+        result["error"] = "branch_name 为空"
+        return result
+    try:
+        def _do() -> Dict:
+            with _engine.connect() as conn:
+                # 先拿 branch_id
+                r1 = conn.execute(
+                    select(_branches).where(_branches.c.name == branch_name)
+                ).fetchone()
+                if r1 is None:
+                    result["ok"] = True
+                    result["error"] = f"分支 '{branch_name}' 还没有写入过快照"
+                    return result
+                bid = r1.id if hasattr(r1, "id") else r1[0]
+                # 计数
+                rows = conn.execute(
+                    select(_branch_file_snapshots.c.status,
+                           _branch_file_snapshots.c.file_size,
+                           _branch_file_snapshots.c.file_path,
+                           _branch_file_snapshots.c.file_name,
+                           _branch_file_snapshots.c.change_time,
+                           _branch_file_snapshots.c.file_hash,
+                           _branch_file_snapshots.c.is_valid,
+                           )
+                    .where(_branch_file_snapshots.c.branch_id == bid)
+                    .order_by(_branch_file_snapshots.c.change_time.desc())
+                ).fetchall()
+                by_status: Dict[str, int] = {}
+                total_size = 0
+                for r in rows:
+                    cols = r._mapping if hasattr(r, "_mapping") else {}
+                    st_val = str(cols.get("status", ""))
+                    by_status[st_val] = by_status.get(st_val, 0) + 1
+                    total_size += float(cols.get("file_size", 0) or 0)
+                result["ok"] = True
+                result["total"] = len(rows)
+                result["total_size"] = total_size
+                result["by_status"] = by_status
+                # 最近 20 条
+                records = []
+                for r in rows[:20]:
+                    cols = r._mapping if hasattr(r, "_mapping") else {}
+                    records.append({
+                        "file_path": str(cols.get("file_path", "")),
+                        "file_name": str(cols.get("file_name", "")),
+                        "status": str(cols.get("status", "")),
+                        "change_time": str(cols.get("change_time", "")),
+                        "is_valid": bool(cols.get("is_valid", True)),
+                        "size": float(cols.get("file_size", 0) or 0),
+                        "hash": str(cols.get("file_hash", ""))[:16],
+                    })
+                result["records"] = records
+                return result
+        return _run_with_fallback("db_get_branch_snapshot_status", _do)
+    except Exception as e:
+        result["ok"] = False
+        result["error"] = str(e)
+        logger.error("[分支快照查询] ❌ branch=%s, err=%s", branch_name, e, exc_info=True)
+        return result
+
+
 
 # ---------- 单元测试 ----------
 

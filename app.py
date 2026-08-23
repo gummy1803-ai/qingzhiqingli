@@ -422,6 +422,16 @@ with st.sidebar:
 
     st.caption(f"内置数据路径: {DATA_ROOT}")
 
+    st.divider()
+
+    # ============================================================
+    # 📁 侧边栏: 分支文件结构（用户指定：从 Tab 移到左栏）
+    # ============================================================
+    from components.branch_ui import render_sidebar_file_structure
+    render_sidebar_file_structure()
+
+    st.divider()
+
     # ✅ 侧边栏底部: DB 状态卡片 + 降级醒目警告
     render_streamlit_db_status(st.sidebar)
 
