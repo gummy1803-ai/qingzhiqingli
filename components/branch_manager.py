@@ -318,19 +318,97 @@ class BranchManager:
     
     def remove_file(self, branch_name: str, file_name: str) -> Tuple[bool, str]:
         """从分支删除文件。"""
+        import time
+        t0 = time.perf_counter()
         branch_path = self._get_branch_path(branch_name)
         target_path = branch_path / file_name
-        
+
+        logger.info("[文件删除] 开始操作: branch=%s, file=%s", branch_name, file_name)
+
         if not target_path.exists():
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.warning("[文件删除] 文件不存在: branch=%s, file=%s (%.1fms)",
+                           branch_name, file_name, elapsed)
             return False, f"文件 '{file_name}' 不存在于分支 '{branch_name}'"
-        
+
+        file_size = target_path.stat().st_size
         try:
             target_path.unlink()
-            self._add_version_record(branch_name, "commit", 
+            self._add_version_record(branch_name, "commit",
                 f"删除文件: {file_name}", -1)
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.info("[文件删除] 成功: branch=%s, file=%s, size=%dKB (%.1fms)",
+                       branch_name, file_name, file_size // 1024, elapsed)
             return True, f"文件 '{file_name}' 已从分支 '{branch_name}' 删除"
         except Exception as e:
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.error("[文件删除] 异常: branch=%s, file=%s, err=%s (%.1fms)",
+                        branch_name, file_name, str(e), elapsed, exc_info=True)
             return False, f"删除失败: {str(e)}"
+
+    def rename_file(self, branch_name: str, old_path: str, new_name: str) -> Tuple[bool, str]:
+        """重命名分支中的文件（支持同级目录改名或移动到同级子目录）。"""
+        import time
+        t0 = time.perf_counter()
+        branch_path = self._get_branch_path(branch_name)
+        old_target = branch_path / old_path
+
+        logger.info("[文件重命名] 开始操作: branch=%s, old=%s -> new=%s",
+                    branch_name, old_path, new_name)
+
+        if not old_target.exists():
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.warning("[文件重命名] 源文件不存在: branch=%s, old=%s (%.1fms)",
+                           branch_name, old_path, elapsed)
+            return False, f"源文件 '{old_path}' 不存在"
+
+        if old_target.is_dir():
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.warning("[文件重命名] 源是目录而非文件: branch=%s, old=%s (%.1fms)",
+                           branch_name, old_path, elapsed)
+            return False, f"'{old_path}' 是目录，暂不支持目录重命名"
+
+        # 处理 new_name：可能仅文件名，也可能带子目录
+        new_path = Path(new_name)
+        if new_path.is_absolute():
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.warning("[文件重命名] 新路径不能为绝对路径: branch=%s, new=%s (%.1fms)",
+                           branch_name, new_name, elapsed)
+            return False, "新路径不能使用绝对路径"
+
+        new_target = branch_path / new_path
+        # 必须保持在 branch_path 内（防穿越）
+        try:
+            new_target.resolve().relative_to(branch_path.resolve())
+        except ValueError:
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.warning("[文件重命名] 新路径越界: branch=%s, old=%s, new=%s (%.1fms)",
+                           branch_name, old_path, new_name, elapsed)
+            return False, "新路径不能跳出分支目录"
+
+        if new_target.exists():
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.warning("[文件重命名] 目标已存在: branch=%s, target=%s (%.1fms)",
+                           branch_name, str(new_path), elapsed)
+            return False, f"目标文件 '{new_name}' 已存在，请先删除或换个名字"
+
+        # 确保目标父目录存在
+        new_target.parent.mkdir(parents=True, exist_ok=True)
+
+        old_size = old_target.stat().st_size
+        try:
+            old_target.rename(new_target)
+            self._add_version_record(branch_name, "commit",
+                f"重命名文件: {old_path} -> {new_name}", -1)
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.info("[文件重命名] 成功: branch=%s, %s -> %s, size=%dKB (%.1fms)",
+                       branch_name, old_path, new_name, old_size // 1024, elapsed)
+            return True, f"已重命名: '{old_path}' → '{new_name}'"
+        except Exception as e:
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.error("[文件重命名] 异常: branch=%s, old=%s, new=%s, err=%s (%.1fms)",
+                        branch_name, old_path, new_name, str(e), elapsed, exc_info=True)
+            return False, f"重命名失败: {str(e)}"
     
     def list_branch_files(self, branch_name: str) -> List[Dict]:
         """列出分支中的所有文件。"""

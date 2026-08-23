@@ -11,6 +11,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from pathlib import Path
 from .branch_manager import BranchManager, get_branch_manager
 
 
@@ -191,19 +192,64 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
         st.dataframe(df, use_container_width=True, hide_index=True, height=300)
         
         # 文件操作
+        with st.expander("✏️ 重命名文件", expanded=False):
+            file_to_rename = st.selectbox(
+                "选择要重命名的文件",
+                options=[f["path"] for f in files],
+                key="file_rename_select",
+                help="支持修改文件名，或用 'subdir/newname.ext' 移动到同级子目录"
+            )
+            default_ext = Path(file_to_rename).suffix if file_to_rename else ""
+            default_stem = Path(file_to_rename).stem if file_to_rename else ""
+            new_name_val = st.text_input(
+                "新名字（含扩展名）",
+                value=file_to_rename if file_to_rename else "",
+                key="file_rename_new_name",
+                placeholder=f"例如: 新文件名{default_ext}  或  subdir/新文件名{default_ext}"
+            )
+            col_a, col_b = st.columns([1, 1])
+            with col_a:
+                if st.button("✅ 确认重命名", type="primary", key="confirm_rename_file_btn", use_container_width=True):
+                    if not new_name_val or new_name_val.strip() == "":
+                        st.error("请输入新文件名")
+                    else:
+                        import logging as _lgg
+                        _ulgg = _lgg.getLogger(__name__)
+                        _ulgg.info("[UI-文件重命名] 用户点击确认: branch=%s, old=%s, new=%s",
+                                    active_branch, file_to_rename, new_name_val)
+                        success, msg = bm.rename_file(active_branch, file_to_rename, new_name_val.strip())
+                        if success:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+            with col_b:
+                if st.button("↩️ 还原成原名", key="reset_rename_name_btn", use_container_width=True):
+                    st.info(f"已还原为: `{file_to_rename}`")
+                    st.rerun()
+
         with st.expander("🗑️ 删除文件", expanded=False):
             file_to_delete = st.selectbox(
                 "选择要删除的文件",
                 options=[f["path"] for f in files],
                 key="file_delete_select"
             )
-            if st.button("删除选中文件", type="primary", key="delete_file_btn"):
-                success, msg = bm.remove_file(active_branch, file_to_delete)
-                if success:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
+            col_c, col_d = st.columns([1, 1])
+            with col_c:
+                confirm_del = st.checkbox(f"⚠️ 确认删除 `{file_to_delete}`？此操作不可恢复", key="confirm_delete_checkbox")
+            with col_d:
+                if st.button("🗑️ 执行删除", type="primary", key="delete_file_btn",
+                             use_container_width=True, disabled=not confirm_del):
+                    import logging as _lgg2
+                    _ulgg2 = _lgg2.getLogger(__name__)
+                    _ulgg2.info("[UI-文件删除] 用户点击确认删除: branch=%s, file=%s",
+                                active_branch, file_to_delete)
+                    success, msg = bm.remove_file(active_branch, file_to_delete)
+                    if success:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
     else:
         st.info("📂 此分支为空，请上传文件")
 
