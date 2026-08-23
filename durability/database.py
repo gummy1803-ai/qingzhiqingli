@@ -1520,6 +1520,35 @@ def db_load_vehicle_minute(
         return pd.DataFrame()
 
 
+def db_load_vehicle_minute_preview(vehicle_id: str, limit: int = 100) -> pd.DataFrame:
+    """轻量版:只取最近 N 条分钟数据,用于上传历史 Tab 快速预览。"""
+    from sqlalchemy import select
+
+    def _do() -> pd.DataFrame:
+        cols = ["vehicle_id", "minute_ts", "file_id", *_VEHICLE_MINUTE_COLS]
+        stmt = (
+            select(*[_vehicle_minute_samples.c[c] for c in cols])
+            .where(_vehicle_minute_samples.c.vehicle_id == vehicle_id)
+            .order_by(_vehicle_minute_samples.c.minute_ts.desc())
+            .limit(limit)
+        )
+        with _engine.connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame([dict(r._mapping) for r in rows])
+        df = df.rename(columns={"minute_ts": "Timestamp"})
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+        df = df.dropna(subset=["Timestamp"])
+        return df.sort_values("Timestamp").reset_index(drop=True)
+
+    try:
+        return _run_with_fallback("db_load_vehicle_minute_preview", _do)
+    except Exception as e:
+        logger.warning("[上传历史] 预览 vehicle=%s 失败: %s", vehicle_id, e)
+        return pd.DataFrame()
+
+
 def db_list_vehicles_in_db() -> List[Dict[str, Any]]:
     """返回 A2 表中所有 (vehicle_id, 最早时间, 最晚时间, 桶数) 汇总,给侧边栏回填车用。"""
     from sqlalchemy import func, select
