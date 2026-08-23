@@ -1168,8 +1168,7 @@ if _recognized:
                         + (f"\n\n💡 其他相关 Tab: {', '.join(_r['extra_tabs'])}" if _r.get("extra_tabs") else ""),
                         icon="🎯",
                     )
-                    st.balloons()
-                    st.snow()
+
 
 
 # ---------- 主区域 Tab（按企业优先级排序） ----------
