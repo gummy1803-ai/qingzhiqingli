@@ -35,6 +35,7 @@ from dotenv import load_dotenv
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, String, Integer, Float,
     Text, Index, text, JSON as _JSON, DateTime, SmallInteger, Boolean,
+    func,
 )
 from sqlalchemy.types import JSON as _SQLA_JSON
 from sqlalchemy.engine import Engine
