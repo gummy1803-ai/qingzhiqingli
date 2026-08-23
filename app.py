@@ -1017,9 +1017,10 @@ if not _has_any:
         "- **① 整车分析**(02_整车数据处理):CSV / Excel,必须含 `Timestamp` 列 → 整车看板/燃电/性能等 8 个 Tab\n"
         "- **② 耐久工步**(01_耐久原始数据处理):Word(.docx) / 耐久XX-YY.xlsx → 「耐久衰减」Tab\n"
         "- **③ 台架循环**(03_台架耐久数据):含「循环/功率点/效率」等关键词的 CSV / Excel → 「台架耐久统计及预警」Tab\n"
-        "- 旧版 `.doc` 请另存为 `.docx` 后再上传"
+        "- 旧版 `.doc` 请另存为 `.docx` 后再上传\n\n"
+        "⬇️ 下方 13 个功能 Tab 已预先渲染,切换 Tab 可查看各模块「暂无数据」占位框架。"
     )
-    st.stop()
+    # ❌ 不再 st.stop()! 继续向下创建 st.tabs(),让各个 Tab 显示预先渲染的空状态卡片
 elif not data and (dur_df is None or len(dur_df) == 0) and _bench_count > 0:
     st.info(
         f"🏭 已检测到 **台架循环数据 {_bench_count:,} 行** (无整车 CSV / 耐久 docx 数据)。\n\n"
