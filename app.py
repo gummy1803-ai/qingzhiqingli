@@ -2318,7 +2318,7 @@ def _render_tab_forecast(
 ) -> None:
     """Tab8: 趋势预测。"""
     st.header("📈 趋势预测")
-    st.caption("基于历史数据线性回归预测未来走势,包含压差/氢耗/故障频率/净功率 4 项。")
+    st.caption("基于历史数据线性回归预测未来走势,支持 7 项指标:压差/氢耗/故障频率/净功率/绝缘电阻/平均单体电压/离均差。")
 
     if not cars:
         st.warning("请先在侧边栏加载数据")
@@ -2350,9 +2350,11 @@ def _render_tab_forecast(
                 if not results:
                     st.warning("数据不足,无法预测。请确保所选车辆含 "
                                "FC_MaxCellVoltage/FC_MinCellVoltage/"
-                               "FC_HydCmInstts/FC_ErrorCode/FC_NetPwrOut 等字段")
+                               "FC_HydCmInstts/FC_ErrorCode/FC_NetPwrOut/"
+                               "FC_VehicleIsolationR/FC_AvgCellVoltage/"
+                               "FC_AvgCellVoltDev 等字段")
                 else:
-                    st.success(f"完成 {len(results)} / 4 项预测")
+                    st.success(f"完成 {len(results)} / 7 项预测")
                     for r in results:
                         with st.expander(
                             f"{r.metric_name}  (斜率={r.slope:+.4f}/h, "

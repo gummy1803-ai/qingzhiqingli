@@ -1,10 +1,13 @@
-"""趋势预测模块:基于历史数据预测 4 个关键指标走势。
+"""趋势预测模块:基于历史数据预测 7 个关键指标走势。
 
 预测目标:
 1. 单片电压压差(劣化趋势)
 2. 累计氢耗(续能估计)
 3. 故障码频率(故障率趋势)
 4. 净功率衰减(电堆衰减)
+5. 绝缘电阻趋势(预测触达报警线时间)
+6. 平均单体电压衰减(电堆健康度)
+7. 离均差趋势(单体一致性劣化)
 
 实现方式: 用 numpy + sklearn 轻量实现,不依赖 statsmodels:
 - 线性回归(长期趋势)
@@ -286,18 +289,205 @@ def forecast_net_power(df: pd.DataFrame,
     )
 
 
+def forecast_insulation(df: pd.DataFrame,
+                        future_hours: float) -> ForecastResult | None:
+    """预测绝缘电阻趋势,计算触达 350kΩ/250kΩ 报警线的时间。"""
+    logger.info("预测绝缘电阻, 输入 %d 行, 预测 %s 小时", len(df), future_hours)
+    if "FC_VehicleIsolationR" not in df.columns or "Timestamp" not in df.columns:
+        return None
+
+    r = _safe_num(df["FC_VehicleIsolationR"])
+    # 过滤坏值: 65535 / >=9999 / <=0
+    r = r[(r > 0) & (r < 9999)].dropna()
+    ts = df["Timestamp"].loc[r.index]
+
+    if len(r) < 10:
+        return None
+
+    hours = _to_hours(ts)
+    if len(hours) == 0:
+        return None
+
+    df_bin = pd.DataFrame({"h": hours, "v": r.to_numpy()})
+    # 每10分钟取最小值(企业规则)
+    df_bin = df_bin.groupby(pd.cut(df_bin["h"], bins=np.arange(
+        0, df_bin["h"].max() + 1, 1 / 6.0))).min().dropna()
+    x = df_bin["h"].to_numpy()
+    y = df_bin["v"].to_numpy()
+
+    if len(x) < 3:
+        return None
+
+    a, b, r2 = _linear_fit(x, y)
+    future_x = np.linspace(x.max(), x.max() + future_hours, 50)
+    future_y = np.maximum(a * future_x + b, 0)
+    resid_std = float(np.std(y - (a * x + b))) if len(y) > 2 else 1.0
+
+    # 计算触达报警线时间
+    alarm_info = ""
+    t_350 = t_250 = None
+    if a < 0:  # 下降趋势
+        t_350 = (350 - b) / a if a != 0 else float("inf")
+        t_250 = (250 - b) / a if a != 0 else float("inf")
+        if t_350 > x.max():
+            alarm_info = f"预测约 {t_350:.1f}h 后触达 350kΩ 一级报警线"
+        elif t_250 > x.max():
+            alarm_info = f"已低于350kΩ,预测约 {t_250:.1f}h 后触达 250kΩ 二级报警线"
+        else:
+            alarm_info = "已低于250kΩ二级报警线,需立即检修"
+    else:
+        alarm_info = "绝缘电阻稳定或上升趋势,暂无触达报警线风险"
+
+    interpretation = _interpret_trend(
+        a, a * 24, "绝缘电阻", ascending_bad=False) + " | " + alarm_info
+
+    return ForecastResult(
+        metric_name="绝缘电阻(kΩ)",
+        history_x=x, history_y=y,
+        future_x=future_x, future_y=future_y,
+        confidence_low=np.maximum(future_y - 1.96 * resid_std, 0),
+        confidence_high=future_y + 1.96 * resid_std,
+        slope=a, r2=r2,
+        interpretation=interpretation,
+        extra={"resid_std": resid_std, "alarm_350h": t_350 if a < 0 else None,
+               "alarm_250h": t_250 if a < 0 else None},
+    )
+
+
+def forecast_avg_cell_voltage(df: pd.DataFrame,
+                              future_hours: float) -> ForecastResult | None:
+    """预测平均单体电压衰减趋势(电堆健康度核心指标)。"""
+    logger.info("预测平均单体电压, 输入 %d 行, 预测 %s 小时", len(df), future_hours)
+    if "FC_AvgCellVoltage" not in df.columns or "Timestamp" not in df.columns:
+        return None
+
+    v = _safe_num(df["FC_AvgCellVoltage"])
+    # 过滤: mV 有效范围 0-2000
+    v = v[(v > 0) & (v < 2000)].dropna()
+    ts = df["Timestamp"].loc[v.index]
+
+    if len(v) < 10:
+        return None
+
+    hours = _to_hours(ts)
+    if len(hours) == 0:
+        return None
+
+    df_bin = pd.DataFrame({"h": hours, "v": v.to_numpy()})
+    df_bin = df_bin.groupby(pd.cut(df_bin["h"], bins=np.arange(
+        0, df_bin["h"].max() + 1, 1.0))).mean().dropna()
+    x = df_bin["h"].to_numpy()
+    y = df_bin["v"].to_numpy()
+
+    if len(x) < 3:
+        return None
+
+    a, b, r2 = _linear_fit(x, y)
+    future_x = np.linspace(x.max(), x.max() + future_hours, 50)
+    future_y = np.maximum(a * future_x + b, 0)
+    resid_std = float(np.std(y - (a * x + b))) if len(y) > 2 else 1.0
+
+    # 600mV 预警线
+    alarm_info = ""
+    t_600 = None
+    if a < 0:
+        t_600 = (600 - b) / a if a != 0 else float("inf")
+        if t_600 > x.max():
+            alarm_info = f"预测约 {t_600:.1f}h 后触达 600mV 预警线"
+        else:
+            alarm_info = "已低于600mV预警线"
+    else:
+        alarm_info = "平均单体电压稳定或上升,暂无触达预警线风险"
+
+    interpretation = _interpret_trend(
+        a, a * 24, "平均单体电压", ascending_bad=False) + " | " + alarm_info
+
+    return ForecastResult(
+        metric_name="平均单体电压(mV)",
+        history_x=x, history_y=y,
+        future_x=future_x, future_y=future_y,
+        confidence_low=np.maximum(future_y - 1.96 * resid_std, 0),
+        confidence_high=future_y + 1.96 * resid_std,
+        slope=a, r2=r2,
+        interpretation=interpretation,
+        extra={"resid_std": resid_std, "alarm_600h": t_600 if a < 0 else None},
+    )
+
+
+def forecast_cell_deviation(df: pd.DataFrame,
+                            future_hours: float) -> ForecastResult | None:
+    """预测离均差趋势(单体一致性劣化,>50mV 触发预警)。"""
+    logger.info("预测离均差, 输入 %d 行, 预测 %s 小时", len(df), future_hours)
+    if "FC_AvgCellVoltDev" not in df.columns or "Timestamp" not in df.columns:
+        return None
+
+    d = _safe_num(df["FC_AvgCellVoltDev"])
+    # 过滤: mV 有效范围 0-200
+    d = d[(d >= 0) & (d < 200)].dropna()
+    ts = df["Timestamp"].loc[d.index]
+
+    if len(d) < 10:
+        return None
+
+    hours = _to_hours(ts)
+    if len(hours) == 0:
+        return None
+
+    df_bin = pd.DataFrame({"h": hours, "v": d.to_numpy()})
+    df_bin = df_bin.groupby(pd.cut(df_bin["h"], bins=np.arange(
+        0, df_bin["h"].max() + 1, 1.0))).mean().dropna()
+    x = df_bin["h"].to_numpy()
+    y = df_bin["v"].to_numpy()
+
+    if len(x) < 3:
+        return None
+
+    a, b, r2 = _linear_fit(x, y)
+    future_x = np.linspace(x.max(), x.max() + future_hours, 50)
+    future_y = np.maximum(a * future_x + b, 0)
+    resid_std = float(np.std(y - (a * x + b))) if len(y) > 2 else 1.0
+
+    # 50mV 预警线
+    alarm_info = ""
+    t_50 = None
+    if a > 0:  # 上升趋势(劣化)
+        t_50 = (50 - b) / a if a != 0 else float("inf")
+        if t_50 > x.max():
+            alarm_info = f"预测约 {t_50:.1f}h 后触达 50mV 预警线"
+        else:
+            alarm_info = "已超过50mV预警线"
+    else:
+        alarm_info = "离均差稳定或下降,一致性良好"
+
+    interpretation = _interpret_trend(
+        a, a * 24, "离均差", ascending_bad=True) + " | " + alarm_info
+
+    return ForecastResult(
+        metric_name="离均差(mV)",
+        history_x=x, history_y=y,
+        future_x=future_x, future_y=future_y,
+        confidence_low=np.maximum(future_y - 1.96 * resid_std, 0),
+        confidence_high=future_y + 1.96 * resid_std,
+        slope=a, r2=r2,
+        interpretation=interpretation,
+        extra={"resid_std": resid_std, "alarm_50h": t_50 if a > 0 else None},
+    )
+
+
 def forecast_all(df: pd.DataFrame, future_hours: float) -> list[ForecastResult]:
-    """对一个车辆 DataFrame 做全部 4 个指标预测。"""
+    """对一个车辆 DataFrame 做全部 7 个指标预测。"""
     results = []
     for fn in (forecast_cell_diff, forecast_hydrogen_cumulative,
-               forecast_fault_frequency, forecast_net_power):
+               forecast_fault_frequency, forecast_net_power,
+               forecast_insulation, forecast_avg_cell_voltage,
+               forecast_cell_deviation):
         try:
             r = fn(df, future_hours)
             if r is not None:
                 results.append(r)
         except Exception as e:
             logger.error("预测 %s 失败: %s", fn.__name__, e, exc_info=True)
-    logger.info("趋势预测完成: 成功 %d / 4", len(results))
+    logger.info("趋势预测完成: 成功 %d / 7", len(results))
     return results
 
 
