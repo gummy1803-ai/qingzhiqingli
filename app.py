@@ -429,6 +429,81 @@ with st.sidebar:
     from components.branch_ui import render_sidebar_file_structure
     render_sidebar_file_structure()
 
+    # ============================================================
+    # 🧭 侧边栏 · 13 个 Tab 分组索引(防止横向滚动找不到 Tab)
+    # ============================================================
+    st.divider()
+    st.markdown(
+        "<div style='font-size:1rem; font-weight:700; margin-bottom:8px;'>🧭 功能导航 · 13 Tab 速查</div>"
+        "<div style='font-size:0.72rem; color:#6B7894; margin-bottom:10px;'>"
+        "Tab 栏太多横向滚动看不见 → 对照下面的分组找对应 Tab</div>",
+        unsafe_allow_html=True,
+    )
+
+    # -------- ① 核心功能区(前4 Tab) --------
+    with st.container(border=True):
+        st.markdown(
+            "<div style='font-weight:700; color:#00D4FF; margin-bottom:4px;'>🏆 核心功能区(Tab 1-4)</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("1️⃣ ⚡ 燃电运行看板 · 整车燃电实时/仿真关键指标")
+        st.caption("2️⃣ 📈 性能统计预测 · 稳态段识别 + 衰减/极化分析")
+        st.caption("3️⃣ 🔌 绝缘阻值统计 · 绝缘监测 + 趋势回归")
+        st.caption("4️⃣ 🔬 台架耐久统计及预警 · 循环聚合 + 🔔飞书推送")
+
+    # -------- ② 辅助分析区(中5 Tab) --------
+    with st.container(border=True):
+        st.markdown(
+            "<div style='font-weight:700; color:#8AD86C; margin-bottom:4px;'>📊 辅助分析区(Tab 5-9)</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("5️⃣ 整车看板 · 分钟级 KPI 汇总 + 下钻")
+        st.caption("6️⃣ 耐久衰减 · docx工步解析 + 趋势分析")
+        st.caption("7️⃣ 趋势预测 · 车辆指标线性回归预测")
+        st.caption("8️⃣ 多车对比 · 多车同图叠加 + 指标对照表")
+        st.caption("9️⃣ 报告导出 · 一键 HTML 测试报告 (Ctrl+P→PDF)")
+
+    # -------- ③ 系统管理区(最后4 Tab) --------
+    with st.container(border=True):
+        st.markdown(
+            "<div style='font-weight:700; color:#FFD93D; margin-bottom:4px;'>⚙️ 系统管理区(Tab 10-13)</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("🔟 AI 助手 · 全产品智能问答 + 字段/阈值说明")
+        # 🌟 飞书特别高亮
+        st.markdown(
+            "<div style='margin:6px 0 4px 0; padding:6px 10px; "
+            "background:rgba(255,94,94,0.10); border:1px solid rgba(255,94,94,0.35); "
+            "border-radius:8px; font-weight:700; color:#FF5E5E;'>"
+            "1️⃣1️⃣ 📡 飞书人员对接 ← 新增联系人/发测试消息/密钥预检</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("1️⃣2️⃣ 📁 上传历史 · 已上传文件回查 + 重命名/删除")
+        st.caption("1️⃣3️⃣ 🌿 分支管理 · 文件版本控制 + Git 对比")
+
+    # -------- 飞书状态小速览(只读,一眼看到有没有已验证联系人) --------
+    try:
+        from durability.feishu_contacts import list_contacts
+        _fc_ct = list_contacts()
+        if _fc_ct:
+            _enabled = sum(1 for c in _fc_ct if c.get("enabled"))
+            _verified = sum(1 for c in _fc_ct if c.get("verified"))
+            with st.container(border=True):
+                col_a, col_b, col_c = st.columns(3)
+                col_a.metric("飞书联系人", len(_fc_ct))
+                col_b.metric("已启用", _enabled)
+                col_c.metric("✅已验证", _verified,
+                             delta="可推送预警" if _verified > 0 else "需点📤发测试消息",
+                             delta_color="normal" if _verified > 0 else "inverse")
+        else:
+            with st.container(border=True):
+                st.markdown(
+                    "⚠️ **还没配置飞书联系人** → 切到「📡 飞书人员对接」Tab,"
+                    "点「📝新增联系人」填 App ID/Secret → 再「📤发送测试消息」激活。",
+                )
+    except Exception as _e_fc:
+        logger.debug("侧边栏飞书联系人速览加载失败(不阻塞): %s", _e_fc)
+
 
 # ---------- 数据装载 ----------
 
