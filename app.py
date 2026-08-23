@@ -712,10 +712,9 @@ if uploaded_files:
         dup_removed = len(merged) - len(merged.drop_duplicates(subset=["Timestamp"], keep="first"))
         merged = merged.drop_duplicates(subset=["Timestamp"], keep="first")
         merged = merged.sort_values("Timestamp").reset_index(drop=True)
-        meta = (parse_csv_filename(uploaded_files[0].name)
-                if Path(uploaded_files[0].name).suffix.lower() == ".csv"
-                else {"vehicle": "上传"})
-        vehicle_id = str(meta.get("vehicle") or "上传")
+        parsed = parse_csv_filename(uploaded_files[0].name) if Path(uploaded_files[0].name).suffix.lower() == ".csv" else None
+        meta = parsed if parsed else {"vehicle": "上传"}
+        vehicle_id = str((meta or {}).get("vehicle") or "上传")
         data[vehicle_id] = merged
         logger.info(
             "[落库] 🚗 整车合并完成: 原始行数=%d → 去重后=%d (Timestamp重复删除=%d) "
