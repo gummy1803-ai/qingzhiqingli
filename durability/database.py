@@ -1,9 +1,17 @@
 """MySQL 数据库模块（腾讯云 MySQL 兼容 + 运行时自动降级 SQLite）。
 
-三张表:
-1. feishu_contacts  - 飞书对接人员(凭证/验证状态/启用状态)
-2. alert_events     - 预警事件(循环/功率/条件/数值/状态)
-3. alert_push_log   - 预警推送记录(事件ID/联系人ID/推送结果)
+——— 数据表一览 ———
+[A类·整车]
+  vehicle_data_files        : 上传过的整车/耐久/台架 文件目录(含 file_hash 去重)
+  vehicle_minute_samples    : 整车数据按 1 分钟 resample 后的聚合明细(核心大表)
+[B类·耐久工步]
+  durability_stages         : docx 解析后的耐久工步(一条 stage × step = 一行)
+[C类·台架循环]
+  bench_cycle_stats         : 台架 CSV 按 (循环×功率点) 聚合后的明细
+[预警·联系人]
+  feishu_contacts           : 飞书对接人员(凭证/验证状态/启用状态)
+  alert_events              : 预警事件(循环/功率/条件/数值/状态) + bench_cycle_id
+  alert_push_log            : 预警推送记录(事件ID/联系人ID/推送结果)
 
 降级机制:
 - 启动阶段: .env 缺失 或 init_db 连不上 MySQL → 立即降级 SQLite, 打印醒目日志
@@ -21,11 +29,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any, Callable
 
+import pandas as pd
+
 from dotenv import load_dotenv
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, String, Integer, Float,
-    Text, Index, text,
+    Text, Index, text, JSON as _JSON, DateTime, SmallInteger, Boolean,
 )
+from sqlalchemy.types import JSON as _SQLA_JSON
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, InterfaceError, DBAPIError
 
@@ -307,9 +318,11 @@ _alert_events = Table(
     Column("quality", String(32)),
     Column("message", Text),
     Column("status", String(32), default="pending"),
+    Column("bench_cycle_id", Integer),   # 🔗 指向 bench_cycle_stats.id, 预警事件反向找到台架行
     Column("created_at", String(32), nullable=False),
     Index("idx_events_status", "status"),
     Index("idx_events_cycle_power", "cycle_id", "power_point"),
+    Index("idx_events_bench_cycle", "bench_cycle_id"),
     mysql_engine="InnoDB",
     mysql_charset="utf8mb4",
     mysql_collate="utf8mb4_unicode_ci",
@@ -324,6 +337,143 @@ _alert_push_log = Table(
     Column("success", Integer, default=0),
     Column("message", Text, default=""),
     Column("push_time", String(32), nullable=False),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
+)
+
+
+# =========================================================================
+# 新增 4 张数据落库表(对应方案 A:先 SQLite,后续配白名单后可切 MySQL 零改动)
+# =========================================================================
+
+# ---------- A1: vehicle_data_files ----------
+# 所有上传文件的"目录"索引(整车 / 耐久 / 台架 三类一起记录)
+# 唯一键: file_hash(按文件字节 SHA256),传同一文件 N 次只入库 1 次
+_vehicle_data_files = Table(
+    "vehicle_data_files", _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("data_kind", String(16), nullable=False, comment="整车/耐久工步/台架循环"),
+    Column("vehicle_id", String(32), default=""),
+    Column("file_name", String(512), nullable=False),
+    Column("file_hash", String(64), nullable=False, unique=True),
+    Column("row_count", Integer, default=0),
+    Column("time_min", String(32)),
+    Column("time_max", String(32)),
+    Column("col_signals", _SQLA_JSON),
+    Column("upload_user", String(64), default="cloud"),
+    Column("uploaded_at", String(32), nullable=False),
+    Column("status", String(16), default="uploaded",
+           comment="uploaded/aggregated/failed"),
+    Column("status_note", Text, default=""),
+    Column("agg_rows", Integer, default=0, comment="聚合后入明细行数"),
+    Column("extra_meta", _SQLA_JSON, comment="耐久sample/台架rig等额外元"),
+    Index("idx_vdf_vehicle", "vehicle_id"),
+    Index("idx_vdf_kind", "data_kind"),
+    Index("idx_vdf_uploaded", "uploaded_at"),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
+)
+
+# ---------- A2: vehicle_minute_samples (真正支撑整车看板/燃电/性能的核心明细表) ----------
+# 企业 9 个核心字段 + 扩展字段(车速/里程/氢耗等),联合唯一键 vehicle_id x minute_ts
+# 单位口径: 严格跟企业对齐(MinCellVoltage/AvgCellVoltage/AvgCellVoltDev 均为 mV)
+_vehicle_minute_samples = Table(
+    "vehicle_minute_samples", _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("vehicle_id", String(32), nullable=False),
+    Column("minute_ts", String(32), nullable=False,
+           comment="ISO 格式字符串分钟桶(如 '2026-08-23T10:15:00')"),
+    Column("file_id", Integer),
+    # 企业 9 字段 ↓↓↓
+    Column("FC_CurrOut", Float(precision=53)),
+    Column("FC_VoltOut", Float(precision=53)),
+    Column("FC_NetPwrOut", Float(precision=53)),
+    Column("FC_MinCellVoltage", Float(precision=53), comment="mV"),
+    Column("FC_MinVoltageChannel", Integer),
+    Column("FC_AvgCellVoltage", Float(precision=53), comment="mV"),
+    Column("FC_AvgCellVoltDev", Float(precision=53), comment="mV"),
+    Column("FC_VehicleIsolationR", Float(precision=53), comment="kΩ"),
+    Column("FC_RunTime_Hours", Float(precision=53)),
+    # 扩展字段 ↓↓↓ (metrics.py 需要的氢耗/里程)
+    Column("FC_VehicleSpd", Float(precision=53), comment="km/h"),
+    Column("FC_VehicleKM", Float(precision=53), comment="km"),
+    Column("FC_HydCmInstts", Float(precision=53)),
+    Column("FC_HydCmPerHundred", Float(precision=53), comment="kg/100km"),
+    Column("FC_ErrorCode", Integer),
+    Column("FC_MainSts", Integer),
+    # 兜底: 上传的文件里可能还带别的列, 这里不一一加列, 缺列时按 NULL 写入即可
+    Index("ix_vms_vid_ts", "vehicle_id", "minute_ts", unique=True),
+    Index("ix_vms_vid_range", "vehicle_id", "minute_ts"),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
+)
+
+# ---------- B1: durability_stages ----------
+# docx 解析后每条工步一行。去重联合唯一键: file_id + stage + step_idx
+_durability_stages = Table(
+    "durability_stages", _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("file_id", Integer, index=True),
+    Column("sample_name", String(256), default=""),
+    Column("stage", String(64), comment="耐久阶段标签,如 '0-5'"),
+    Column("stage_start_h", Float(precision=53)),
+    Column("step_idx", Integer),
+    # docx 标准列(中文名原样):数值化后落库
+    Column("target_power_kw", Float(precision=53)),
+    Column("humidity_pct", Float(precision=53)),
+    Column("temperature_c", Float(precision=53)),
+    Column("net_power_kw", Float(precision=53)),
+    Column("stack_current_a", Float(precision=53)),
+    Column("avg_cell_voltage_v", Float(precision=53)),
+    Column("avg_voltage_deviation_v", Float(precision=53), comment="离均差,V"),
+    Column("compressor_power_kw", Float(precision=53)),
+    Column("pump_power_kw", Float(precision=53)),
+    Column("coolant_in_c", Float(precision=53)),
+    Column("coolant_out_c", Float(precision=53)),
+    Column("hfr", Float(precision=53)),
+    Column("lfr", Float(precision=53)),
+    Column("voltage_variance", Float(precision=53)),
+    Column("raw_file_name", String(512)),
+    Column("uploaded_at", String(32)),
+    Index("ix_ds_fileid_stage_step", "file_id", "stage", "step_idx", unique=True),
+    Index("ix_ds_sample", "sample_name"),
+    Index("ix_ds_stage_start", "stage_start_h"),
+    mysql_engine="InnoDB",
+    mysql_charset="utf8mb4",
+    mysql_collate="utf8mb4_unicode_ci",
+)
+
+# ---------- C1: bench_cycle_stats ----------
+# 台架 aggregate_durability_stats 每行直接一条。唯一 (rig_id, cycle_id, power_point)
+_bench_cycle_stats = Table(
+    "bench_cycle_stats", _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("file_id", Integer, index=True),
+    Column("rig_id", String(64), default="unknown"),
+    Column("cycle_id", Integer, nullable=False),
+    Column("power_point", Float(precision=53), nullable=False),
+    Column("data_count", Integer),
+    Column("quality", String(32), default="正常"),
+    # 均值列(按 _SIGNAL_COLS / signal_columns 动态,有就写没有 NULL)
+    Column("FC_AvgCellVoltage_mean", Float(precision=53), comment="mV"),
+    Column("FC_AvgCellVoltDev_mean", Float(precision=53), comment="mV"),
+    Column("FC_VARVoltage_mean", Float(precision=53)),
+    Column("FC_LFR_mean", Float(precision=53)),
+    Column("FC_HFR_mean", Float(precision=53)),
+    Column("FC_CurrOut_mean", Float(precision=53)),
+    Column("FC_VoltOut_mean", Float(precision=53)),
+    Column("FC_NetPwrOut_mean", Float(precision=53)),
+    Column("FC_MinCellVoltage_mean", Float(precision=53), comment="mV"),
+    # 波动列(选写,只把关键信号的 std 也落一份便于 UI 稳定性展示)
+    Column("FC_AvgCellVoltage_std", Float(precision=53)),
+    Column("FC_AvgCellVoltDev_std", Float(precision=53)),
+    Column("source_file_name", String(512)),
+    Column("created_at", String(32)),
+    Index("ix_bcs_rig_cycle_pp", "rig_id", "cycle_id", "power_point", unique=True),
+    Index("ix_bcs_cycle_pp", "cycle_id", "power_point"),
     mysql_engine="InnoDB",
     mysql_charset="utf8mb4",
     mysql_collate="utf8mb4_unicode_ci",
@@ -381,6 +531,11 @@ def init_db() -> None:
         backend_before = "MySQL" if _USE_MYSQL else "SQLite"
         logger.info("[DB 初始化] Step2 create_all 检查表结构 | 后端=%s", backend_before)
         _metadata.create_all(_engine, checkfirst=True)
+        # ---- Step2.5: 在线 ALTER TABLE 补齐"已有表的新列"(老版本 SQLite/MySQL 兼容) ----
+        # create_all(checkfirst=True) 不会给已存在的表加新列(比如 alert_events 的 bench_cycle_id,
+        # 是这轮方案A新增的), 所以这里独立做一次"列存在性探测→缺了就ALTER"。
+        # 跨后端兼容: SQLite/MySQL 都支持 ALTER TABLE t ADD COLUMN ...
+        _apply_schema_migrations(_engine)
         cost_ms = (time.perf_counter() - t0) * 1000
         if _USE_MYSQL:
             logger.info(
@@ -388,7 +543,9 @@ def init_db() -> None:
                 "[DB 后端] Host:   %s:%s\n"
                 "[DB 后端] DB:     %s\n"
                 "[DB 后端] User:   %s\n"
-                "[DB 后端] 表:     feishu_contacts / alert_events / alert_push_log\n"
+                "[DB 后端] 表(联系人·预警): feishu_contacts / alert_events / alert_push_log\n"
+                "[DB 后端] 表(数据落库×7): vehicle_data_files / vehicle_minute_samples\n"
+                "[DB 后端]                    durability_stages / bench_cycle_stats\n"
                 "[DB 后端] 若外网中断, 将自动降级到本地 SQLite\n%s",
                 _FALLBACK_BANNER, cost_ms,
                 _DB_CFG["DB_HOST"], _DB_CFG["DB_PORT"],
@@ -399,7 +556,9 @@ def init_db() -> None:
             logger.info(
                 "\n%s\n[DB 后端] 🗃️  当前使用本地 SQLite (耗时 %.0fms)\n"
                 "[DB 后端] 路径: %s\n"
-                "[DB 后端] 表:   feishu_contacts / alert_events / alert_push_log\n%s",
+                "[DB 后端] 表(联系人·预警): feishu_contacts / alert_events / alert_push_log\n"
+                "[DB 后端] 表(数据落库×7): vehicle_data_files / vehicle_minute_samples\n"
+                "[DB 后端]                    durability_stages / bench_cycle_stats\n%s",
                 _FALLBACK_BANNER, cost_ms, _SQLITE_PATH, _FALLBACK_BANNER,
             )
     except Exception as e:
@@ -411,6 +570,11 @@ def init_db() -> None:
             cost_ms = (time.perf_counter() - t0) * 1000
             logger.info("[DB 初始化] SQLite 初始化完成(启动建表失败降级) | 耗时 %.0fms 路径=%s",
                         cost_ms, _SQLITE_PATH)
+            # 降级后也要补齐迁移列
+            try:
+                _apply_schema_migrations(_engine)
+            except Exception as _mg_ex:
+                logger.warning("[DB 初始化] 迁移列补齐(降级后)失败: %s", _mg_ex)
         else:
             logger.error("[DB 初始化] init_db 失败 | 总耗时 %.0fms  err=%s",
                          (time.perf_counter() - t0) * 1000, e, exc_info=True)
@@ -419,6 +583,58 @@ def init_db() -> None:
 
 # ---------- 内部工具 ----------
 
+# ------ 在线迁移(ALTER TABLE t ADD COLUMN ...) ------
+# 解决「SQLAlchemy create_all(checkfirst=True) 不会给已存在的老表加新列」问题。
+# 结构: _SCHEMA_MIGRATIONS = [(table_name, column_name, sqlalchemy_column_obj), ...]
+_SCHEMA_MIGRATIONS: List[Tuple[str, str, Column]] = [
+    ("alert_events", "bench_cycle_id",
+     Column("bench_cycle_id", Integer)),
+]
+
+
+def _apply_schema_migrations(engine) -> None:
+    """对每一条迁移规则:先查该列是否存在,不存在就 ADD COLUMN。"""
+    if len(_SCHEMA_MIGRATIONS) == 0:
+        return
+    try:
+        insp = engine.dialect.has_table  # type: ignore[attr-defined]
+    except Exception:
+        insp = None  # 兜底走 pragma 直接查
+    import sqlalchemy as _sa
+    with engine.connect() as conn:
+        for table_name, col_name, col_obj in _SCHEMA_MIGRATIONS:
+            try:
+                # 跨后端统一方法: insp.get_columns
+                cols = _sa.inspect(conn).get_columns(table_name)
+                if any(c["name"] == col_name for c in cols):
+                    logger.debug("[迁移] 列 %s.%s 已存在,跳过", table_name, col_name)
+                    continue
+            except Exception as _e:
+                logger.warning("[迁移] 探测列 %s.%s 失败: %s (尝试直接 ALTER)",
+                               table_name, col_name, _e)
+            # 拼接 DDL: 用 compile 方式拿后端兼容的 ADD COLUMN 子句
+            try:
+                ddl = str(
+                    _sa.schema.AddColumn(table_name, col_obj)
+                    .compile(dialect=engine.dialect)
+                )
+            except Exception:
+                # 兜底手动拼
+                type_str = "INTEGER"  # 目前唯一的迁移列 bench_cycle_id 就是 INTEGER
+                ddl = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {type_str}"
+            logger.info("[迁移] 补列(跨后端 DDL): %s", ddl.strip())
+            try:
+                conn.execute(text(ddl))
+                conn.commit()
+            except Exception as al_ex:
+                # SQLite/MySQL 有时候 "duplicate column" 也会抛, 属于安全忽略
+                logger.info("[迁移] 补列 DDL 执行结果: %s (重复列可忽略)", al_ex)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+
 def _rows_to_list(rows) -> List[Dict[str, Any]]:
     return [dict(r._mapping) for r in rows]
 
@@ -426,7 +642,11 @@ def _rows_to_list(rows) -> List[Dict[str, Any]]:
 def _next_seq(table_name: str) -> int:
     t = {"feishu_contacts": _feishu_contacts,
          "alert_events": _alert_events,
-         "alert_push_log": _alert_push_log}.get(table_name)
+         "alert_push_log": _alert_push_log,
+         "vehicle_data_files": _vehicle_data_files,
+         "vehicle_minute_samples": _vehicle_minute_samples,
+         "durability_stages": _durability_stages,
+         "bench_cycle_stats": _bench_cycle_stats}.get(table_name)
     if t is None:
         return 0
     try:
@@ -807,6 +1027,671 @@ def db_count_events() -> int:
         return _run_with_fallback("db_count_events", _do)
     except Exception:
         return 0
+
+
+# =========================================================================
+# 落库 CRUD · 通用工具
+# =========================================================================
+
+def _sha256_bytes(raw: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _upsert_by_unique(table, unique_where: Dict, values: Dict,
+                      conn) -> Any:
+    """在 conn 内先 select(按唯一键) → 有就 update(仅更新非唯一值列),无就 insert。
+    返回 (inserted_flag, row) 。注意: conn 不 commit, 由调用方控制事务。
+    """
+    from sqlalchemy import select
+    sel_cond = [table.c[k] == v for k, v in unique_where.items()]
+    exist = conn.execute(select(table).where(*sel_cond)).fetchone()
+    non_unique_cols = {c.name for c in table.columns
+                       if c.primary_key is False
+                       and not any(
+                           (idx.unique and c.name in {cc.name for cc in idx.columns})
+                           for idx in (table.indexes or set())
+                       )}
+    if exist is not None:
+        upd_cols = {c: v for c, v in values.items()
+                    if c in non_unique_cols and c not in unique_where}
+        if upd_cols:
+            conn.execute(table.update().where(*sel_cond).values(**upd_cols))
+        pk_name = [c.name for c in table.columns if c.primary_key][0]
+        return False, dict(exist._mapping).get(pk_name) or dict(exist._mapping)
+    merged = {**unique_where, **values}
+    cur = conn.execute(table.insert().values(**merged))
+    pk_name = [c.name for c in table.columns if c.primary_key][0]
+    # SQLite / MySQL: cur.lastrowid
+    new_id = getattr(cur, "lastrowid", None)
+    if new_id is None and table.c[pk_name].type.python_type == int:
+        # fallback: 再查一次
+        exist2 = conn.execute(select(table).where(*sel_where)).fetchone()
+        if exist2 is not None:
+            new_id = dict(exist2._mapping).get(pk_name)
+    return True, new_id
+
+
+# =========================================================================
+# A1 · vehicle_data_files 上传文件索引 CRUD
+# =========================================================================
+
+def db_upsert_data_file(
+    data_kind: str,
+    file_name: str,
+    file_bytes: Optional[bytes] = None,
+    file_hash: Optional[str] = None,
+    *,
+    vehicle_id: str = "",
+    row_count: int = 0,
+    time_min: Optional[str] = None,
+    time_max: Optional[str] = None,
+    col_signals: Optional[List[str]] = None,
+    upload_user: str = "cloud",
+    status: str = "uploaded",
+    status_note: str = "",
+    agg_rows: int = 0,
+    extra_meta: Optional[Dict] = None,
+) -> Tuple[int, bool, str]:
+    """写入或更新上传文件索引,按 file_hash 唯一。
+    返回 (file_id, 是否新插入, file_hash)。"""
+    if file_hash is None:
+        if file_bytes is None:
+            raise ValueError("db_upsert_data_file 需要 file_bytes 或 file_hash 之一")
+        file_hash = _sha256_bytes(file_bytes)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    vals = dict(
+        data_kind=data_kind,
+        vehicle_id=vehicle_id,
+        file_name=file_name,
+        row_count=row_count,
+        time_min=time_min,
+        time_max=time_max,
+        col_signals=list(col_signals) if col_signals else [],
+        upload_user=upload_user,
+        uploaded_at=now,
+        status=status,
+        status_note=status_note,
+        agg_rows=agg_rows,
+        extra_meta=dict(extra_meta) if extra_meta else {},
+    )
+
+    def _do() -> Tuple[int, bool, str]:
+        with _engine.connect() as conn:
+            inserted, pk = _upsert_by_unique(
+                _vehicle_data_files, {"file_hash": file_hash}, vals, conn)
+            conn.commit()
+        if pk is None:
+            logger.error("db_upsert_data_file 未取到主键 file_hash=%s", file_hash)
+            return 0, bool(inserted), file_hash
+        if isinstance(pk, dict):
+            pk = pk.get("id", 0)
+        return int(pk), bool(inserted), file_hash
+
+    try:
+        fid, inserted, fhash = _run_with_fallback("db_upsert_data_file", _do)
+        short = file_name[-40:]
+        if inserted:
+            logger.info(
+                "[落库] ✅ 新文件索引 kind=%s vehicle=%s file=%s row=%d fid=%s",
+                data_kind, vehicle_id, short, row_count, fid)
+        else:
+            logger.info("[落库] ↻ 文件已存在,跳过 hash=%s… fid=%s", fhash[:12], fid)
+        return fid, inserted, fhash
+    except Exception as e:
+        logger.error("[落库] ❌ db_upsert_data_file 失败 name=%s err=%s", file_name, e, exc_info=True)
+        raise
+
+
+def db_list_data_files(data_kind: Optional[str] = None) -> List[Dict]:
+    from sqlalchemy import select
+    def _do() -> List[Dict]:
+        stmt = select(_vehicle_data_files)
+        if data_kind:
+            stmt = stmt.where(_vehicle_data_files.c.data_kind == data_kind)
+        stmt = stmt.order_by(_vehicle_data_files.c.uploaded_at.desc())
+        with _engine.connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+        return _rows_to_list(rows)
+    try:
+        return _run_with_fallback("db_list_data_files", _do)
+    except Exception as e:
+        logger.warning("db_list_data_files 失败: %s", e)
+        return []
+
+
+def db_count_data_files(kind: Optional[str] = None) -> int:
+    from sqlalchemy import func, select
+    def _do() -> int:
+        stmt = select(func.count()).select_from(_vehicle_data_files)
+        if kind:
+            stmt = stmt.where(_vehicle_data_files.c.data_kind == kind)
+        with _engine.connect() as conn:
+            return conn.execute(stmt).scalar() or 0
+    try:
+        return _run_with_fallback("db_count_data_files", _do)
+    except Exception:
+        return 0
+
+
+# =========================================================================
+# A2 · vehicle_minute_samples 整车分钟级明细 CRUD
+# =========================================================================
+
+# 入 A2 表实际会用到的所有列名(企业 9 + 扩展)
+_VEHICLE_MINUTE_COLS: List[str] = [
+    "FC_CurrOut", "FC_VoltOut", "FC_NetPwrOut",
+    "FC_MinCellVoltage", "FC_MinVoltageChannel",
+    "FC_AvgCellVoltage", "FC_AvgCellVoltDev",
+    "FC_VehicleIsolationR", "FC_RunTime_Hours",
+    "FC_VehicleSpd", "FC_VehicleKM",
+    "FC_HydCmInstts", "FC_HydCmPerHundred",
+    "FC_ErrorCode", "FC_MainSts",
+]
+
+
+def _is_mv_scale(df: pd.DataFrame, col: str) -> bool:
+    """启发式判断原始列单位是否是 V(不是企业要求的 mV)。
+    只要 col 在 MinCellVoltage / AvgCellVoltage / AvgCellVoltDev 中, 且 max<10, 就判定是 V 制 → ×1000 转成 mV。
+    """
+    if col not in ("FC_MinCellVoltage", "FC_AvgCellVoltage", "FC_AvgCellVoltDev"):
+        return False
+    s = pd.to_numeric(df[col], errors="coerce").dropna()
+    if len(s) == 0:
+        return False
+    return bool((s.max() or 0) < 10.0)  # 典型 V 制 3.6~3.9 远小于 10
+
+
+def db_write_vehicle_minute(
+    vehicle_id: str,
+    df_vehicle: pd.DataFrame,
+    file_id: int = 0,
+    upsert: bool = True,
+) -> int:
+    """把整车 DataFrame (已做 Timestamp dropna/sort) 按 1min resample 后写入 A2。
+    企业 3 个电压列如果是 V 制(原始 CSV 常见), 自动转 mV 制(企业口径)。
+    返回成功写入行数(按分钟桶)。
+    """
+    if df_vehicle is None or len(df_vehicle) == 0:
+        return 0
+    work = df_vehicle.copy()
+    if "Timestamp" not in work.columns:
+        raise ValueError("db_write_vehicle_minute 输入 DataFrame 必须含 Timestamp 列")
+    work["Timestamp"] = pd.to_datetime(work["Timestamp"], errors="coerce")
+    work = work.dropna(subset=["Timestamp"]).set_index("Timestamp")
+    if len(work) == 0:
+        return 0
+    # ---------- V → mV 自动转换(启发式) ----------
+    for col in ("FC_MinCellVoltage", "FC_AvgCellVoltage", "FC_AvgCellVoltDev"):
+        if col in work.columns and _is_mv_scale(work, col):
+            work[col] = pd.to_numeric(work[col], errors="coerce") * 1000.0
+            logger.info("[落库A2] %s: 检测为 V 制, 自动 ×1000 → mV (企业口径)", col)
+    # ---------- 1 分钟 resample(通道 last + 数值 mean) ----------
+    agg_map: Dict[str, str] = {}
+    for col in work.columns:
+        if col == "FC_MinVoltageChannel":
+            agg_map[col] = "last"
+        elif pd.api.types.is_numeric_dtype(work[col]):
+            agg_map[col] = "mean"
+        else:
+            continue  # 非数值/通道号字符串列不写
+    rs = work.resample("1min").agg(agg_map).dropna(how="all")
+    if len(rs) == 0:
+        logger.warning("[落库A2] resample 后为空,跳过 vehicle=%s", vehicle_id)
+        return 0
+    rows: List[Dict] = []
+    for ts, rec in rs.iterrows():
+        minute_str = ts.strftime("%Y-%m-%d %H:%M:00")
+        row: Dict[str, Any] = {"vehicle_id": vehicle_id,
+                               "minute_ts": minute_str,
+                               "file_id": int(file_id) or None}
+        for c in _VEHICLE_MINUTE_COLS:
+            if c in rec.index and pd.notna(rec[c]):
+                row[c] = None if pd.isna(rec[c]) else (
+                    int(rec[c]) if c == "FC_MinVoltageChannel" or c == "FC_ErrorCode"
+                    or c == "FC_MainSts" else float(rec[c]))
+        rows.append(row)
+    if not rows:
+        return 0
+
+    def _do() -> int:
+        inserted_rows = 0
+        with _engine.connect() as conn:
+            # SQLite/MySQL: 按批次 + 唯一键冲突忽略(INSERT OR IGNORE / INSERT IGNORE)
+            # 为了兼容两种后端,这里改用"逐行 ORM upsert by 联合唯一键"太慢 → 分批次 insert,
+            # 冲突行由 try/except IntegrityError 走单行 select+upsert
+            from sqlalchemy import select
+            from sqlalchemy.exc import IntegrityError
+            BATCH = 300
+            for i in range(0, len(rows), BATCH):
+                batch = rows[i:i + BATCH]
+                try:
+                    conn.execute(_vehicle_minute_samples.insert(), batch)
+                    inserted_rows += len(batch)
+                except IntegrityError:
+                    # 命中唯一键(同车同分钟),退回逐行处理
+                    conn.rollback()
+                    for r in batch:
+                        sel = conn.execute(
+                            select(_vehicle_minute_samples).where(
+                                _vehicle_minute_samples.c.vehicle_id == r["vehicle_id"],
+                                _vehicle_minute_samples.c.minute_ts == r["minute_ts"],
+                            )
+                        ).fetchone()
+                        if sel is None:
+                            conn.execute(_vehicle_minute_samples.insert().values(**r))
+                            inserted_rows += 1
+                        elif upsert:
+                            upd = {k: v for k, v in r.items()
+                                   if k not in ("vehicle_id", "minute_ts") and v is not None}
+                            if upd:
+                                conn.execute(
+                                    _vehicle_minute_samples.update().where(
+                                        _vehicle_minute_samples.c.vehicle_id == r["vehicle_id"],
+                                        _vehicle_minute_samples.c.minute_ts == r["minute_ts"],
+                                    ).values(**upd)
+                                )
+            conn.commit()
+        return inserted_rows
+
+    t0 = time.perf_counter()
+    try:
+        cnt = _run_with_fallback("db_write_vehicle_minute", _do)
+        logger.info(
+            "[落库A2] ✅ vehicle=%s 原始行=%d → 分钟桶=%d | 成功写入=%d | 耗时=%.1fs",
+            vehicle_id, len(df_vehicle), len(rows), cnt,
+            (time.perf_counter() - t0))
+        return int(cnt)
+    except Exception as e:
+        logger.error("[落库A2] ❌ vehicle=%s 失败: %s", vehicle_id, e, exc_info=True)
+        raise
+
+
+def db_load_vehicle_minute(
+    vehicle_id: str,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """把 A2 中某车某时间范围拉回 DataFrame(Timestamp 列, 跟 data[vehicle_id] 对齐)。"""
+    from sqlalchemy import select
+    cols = ["vehicle_id", "minute_ts", "file_id", *_VEHICLE_MINUTE_COLS]
+
+    def _do() -> pd.DataFrame:
+        stmt = select(*[_vehicle_minute_samples.c[c] for c in cols]) \
+            .where(_vehicle_minute_samples.c.vehicle_id == vehicle_id)
+        if start_dt is not None:
+            stmt = stmt.where(
+                _vehicle_minute_samples.c.minute_ts
+                >= start_dt.strftime("%Y-%m-%d %H:%M:%S"))
+        if end_dt is not None:
+            stmt = stmt.where(
+                _vehicle_minute_samples.c.minute_ts
+                <= end_dt.strftime("%Y-%m-%d %H:%M:%S"))
+        stmt = stmt.order_by(_vehicle_minute_samples.c.minute_ts)
+        with _engine.connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame([dict(r._mapping) for r in rows])
+        df = df.rename(columns={"minute_ts": "Timestamp"})
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+        df = df.dropna(subset=["Timestamp"])
+        return df.reset_index(drop=True)
+
+    try:
+        return _run_with_fallback("db_load_vehicle_minute", _do)
+    except Exception as e:
+        logger.warning("db_load_vehicle_minute vehicle=%s 失败: %s", vehicle_id, e)
+        return pd.DataFrame()
+
+
+def db_list_vehicles_in_db() -> List[Dict[str, Any]]:
+    """返回 A2 表中所有 (vehicle_id, 最早时间, 最晚时间, 桶数) 汇总,给侧边栏回填车用。"""
+    from sqlalchemy import func, select
+    t = _vehicle_minute_samples
+
+    def _do() -> List[Dict]:
+        stmt = (select(t.c.vehicle_id,
+                       func.min(t.c.minute_ts).label("time_min"),
+                       func.max(t.c.minute_ts).label("time_max"),
+                       func.count().label("n_buckets"))
+                .group_by(t.c.vehicle_id)
+                .order_by(t.c.vehicle_id))
+        with _engine.connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+        return [dict(r._mapping) for r in rows]
+
+    try:
+        return _run_with_fallback("db_list_vehicles_in_db", _do)
+    except Exception as e:
+        logger.warning("db_list_vehicles_in_db 失败: %s", e)
+        return []
+
+
+# =========================================================================
+# B1 · durability_stages 耐久工步 CRUD
+# =========================================================================
+
+# docx 中文列名 → B1 英文字段名 映射
+_DUR_COL_MAP: Dict[str, str] = {
+    "目标功率(kW)": "target_power_kw",
+    "湿度": "humidity_pct",
+    "温度": "temperature_c",
+    "净输出功率(kW)": "net_power_kw",
+    "电堆电流(A)": "stack_current_a",
+    "平均单体电压(V)": "avg_cell_voltage_v",
+    "离均差": "avg_voltage_deviation_v",
+    "空压机功耗(kW)": "compressor_power_kw",
+    "水泵功耗(kW)": "pump_power_kw",
+    "冷却水入口温度(℃)": "coolant_in_c",
+    "冷却水出口温度(℃)": "coolant_out_c",
+    "HFR": "hfr",
+    "LFR": "lfr",
+    "电压方差": "voltage_variance",
+}
+_DUR_FIXED_COLS = {"stage", "stage_start_h", "step_idx", "file"}
+
+
+def db_write_durability_stages(
+    df_docx: pd.DataFrame,
+    file_id: int = 0,
+    sample_name: str = "",
+    raw_file_name: str = "",
+) -> int:
+    """把 load_durability_docx 产出的 docx 宽表落 B1。去重: file_id + stage + step_idx。
+    返回实际写入的行数(新插入 + 更新)。
+    """
+    if df_docx is None or len(df_docx) == 0:
+        return 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 规范化 docx 列 → 英文字段
+    rows: List[Dict] = []
+    for _, rec in df_docx.iterrows():
+        base: Dict[str, Any] = {
+            "file_id": int(file_id) or None,
+            "sample_name": sample_name,
+            "stage": str(rec.get("stage", "")) if pd.notna(rec.get("stage")) else "",
+            "stage_start_h": None if pd.isna(rec.get("stage_start_h"))
+                              else float(rec["stage_start_h"]),
+            "step_idx": None if pd.isna(rec.get("step_idx"))
+                         else int(rec["step_idx"]),
+            "raw_file_name": str(rec.get("file", raw_file_name) or raw_file_name),
+            "uploaded_at": now,
+        }
+        for zh_col, en_col in _DUR_COL_MAP.items():
+            if zh_col in rec.index and pd.notna(rec[zh_col]):
+                try:
+                    base[en_col] = float(rec[zh_col])
+                except Exception:
+                    base[en_col] = None
+        # 唯一键缺一不可: file_id 未知时退化为 (sample_name, stage, step_idx)
+        rows.append(base)
+
+    def _do() -> int:
+        from sqlalchemy import select
+        from sqlalchemy.exc import IntegrityError
+        written = 0
+        with _engine.connect() as conn:
+            for r in rows:
+                # 构造联合唯一条件:file_id 有就用,没有就退 (sample_name+stage+step_idx)
+                if r.get("file_id"):
+                    conds = [_durability_stages.c.file_id == r["file_id"],
+                             _durability_stages.c.stage == r["stage"],
+                             _durability_stages.c.step_idx == r["step_idx"]]
+                else:
+                    conds = [_durability_stages.c.sample_name == r["sample_name"],
+                             _durability_stages.c.stage == r["stage"],
+                             _durability_stages.c.step_idx == r["step_idx"]]
+                exist = conn.execute(select(_durability_stages).where(*conds)).fetchone()
+                if exist is None:
+                    try:
+                        conn.execute(_durability_stages.insert().values(**r))
+                        written += 1
+                    except IntegrityError:
+                        pass  # 并发场景跳过
+                else:
+                    upd = {k: v for k, v in r.items()
+                           if v is not None and k not in ("file_id", "stage", "step_idx",
+                                                          "sample_name")}
+                    if upd:
+                        conn.execute(
+                            _durability_stages.update().where(*conds).values(**upd))
+                        written += 1
+            conn.commit()
+        return written
+
+    try:
+        cnt = _run_with_fallback("db_write_durability_stages", _do)
+        logger.info(
+            "[落库B1] ✅ sample=%s raw=%s 输入行=%d 实际写入=%d fid=%s",
+            sample_name, raw_file_name or "(空)", len(rows), cnt, file_id)
+        return int(cnt)
+    except Exception as e:
+        logger.error("[落库B1] ❌ 失败 sample=%s raw=%s err=%s", sample_name, raw_file_name, e, exc_info=True)
+        raise
+
+
+def db_load_durability_stages(sample_name: Optional[str] = None) -> pd.DataFrame:
+    """把 B1 拉回成与 load_durability_docx 近似对齐的宽表(中文列名 + stage/stage_start_h/step_idx/file)。
+    UI 端直接替换 dur_df。
+    """
+    from sqlalchemy import select
+    t = _durability_stages
+
+    def _do() -> pd.DataFrame:
+        from sqlalchemy import case
+        stmt = select(t)
+        if sample_name:
+            stmt = stmt.where(t.c.sample_name == sample_name)
+        # MySQL 不支持 NULLS LAST 语法, 用 CASE WHEN IS NULL 做跨库兼容
+        stage_start_order = case((t.c.stage_start_h.is_(None), 1), else_=0)
+        step_idx_order = case((t.c.step_idx.is_(None), 1), else_=0)
+        stmt = stmt.order_by(stage_start_order, t.c.stage_start_h.asc(),
+                             step_idx_order, t.c.step_idx.asc())
+        with _engine.connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+        if not rows:
+            return pd.DataFrame()
+        tmp = pd.DataFrame([dict(r._mapping) for r in rows])
+        # 英文 → docx 原文中文列名
+        out_cols = {}
+        for zh, en in _DUR_COL_MAP.items():
+            if en in tmp.columns:
+                out_cols[zh] = tmp[en]
+        for extra in ("stage", "stage_start_h", "step_idx"):
+            if extra in tmp.columns:
+                out_cols[extra] = tmp[extra]
+        if "raw_file_name" in tmp.columns:
+            out_cols["file"] = tmp["raw_file_name"].fillna("")
+        df = pd.DataFrame(out_cols)
+        return df.reset_index(drop=True)
+
+    try:
+        return _run_with_fallback("db_load_durability_stages", _do)
+    except Exception as e:
+        logger.warning("db_load_durability_stages 失败: %s", e)
+        return pd.DataFrame()
+
+
+# =========================================================================
+# C1 · bench_cycle_stats 台架循环聚合 CRUD
+# =========================================================================
+
+# C1 表均值列: 信号 → 列名映射(跟台架 _SIGNAL_COLS 对齐)
+_BENCH_MEAN_COL_MAP: Dict[str, str] = {
+    "FC_AvgCellVoltage": "FC_AvgCellVoltage_mean",
+    "FC_AvgCellVoltDev": "FC_AvgCellVoltDev_mean",
+    "FC_VARVoltage": "FC_VARVoltage_mean",
+    "FC_LFR": "FC_LFR_mean",
+    "FC_HFR": "FC_HFR_mean",
+    "FC_CurrOut": "FC_CurrOut_mean",
+    "FC_VoltOut": "FC_VoltOut_mean",
+    "FC_NetPwrOut": "FC_NetPwrOut_mean",
+    "FC_MinCellVoltage": "FC_MinCellVoltage_mean",
+}
+_BENCH_STD_COL_MAP: Dict[str, str] = {
+    "FC_AvgCellVoltage": "FC_AvgCellVoltage_std",
+    "FC_AvgCellVoltDev": "FC_AvgCellVoltDev_std",
+}
+
+
+def db_write_bench_cycle_stats(
+    agg_df: pd.DataFrame,
+    *,
+    file_id: int = 0,
+    rig_id: str = "unknown",
+    source_file_name: str = "",
+) -> Tuple[int, List[int]]:
+    """把 aggregate_durability_stats 的输出(行=cycle×power_point) 写 C1。
+    返回 (写入/更新行数, [本次命中/新写入的 id 列表])。
+    """
+    if agg_df is None or len(agg_df) == 0:
+        return 0, []
+    # 要求列 cycle_id / power_point / 数据量 / 质量标记
+    if "cycle_id" not in agg_df.columns or "power_point" not in agg_df.columns:
+        raise ValueError("db_write_bench_cycle_stats 输入缺 cycle_id / power_point 列")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows: List[Dict] = []
+    for _, rec in agg_df.iterrows():
+        row: Dict[str, Any] = {
+            "file_id": int(file_id) or None,
+            "rig_id": str(rig_id or "unknown"),
+            "cycle_id": int(rec["cycle_id"]),
+            "power_point": float(rec["power_point"]),
+            "data_count": int(rec.get("数据量")) if pd.notna(rec.get("数据量")) else None,
+            "quality": str(rec.get("质量标记") or "正常"),
+            "source_file_name": source_file_name,
+            "created_at": now,
+        }
+        # 动态填均值/std 列
+        for signal, col in _BENCH_MEAN_COL_MAP.items():
+            key_mean = f"{signal}_mean"
+            key_std = f"{signal}_std"
+            if key_mean in rec.index and pd.notna(rec[key_mean]):
+                v = float(rec[key_mean])
+                # 统一 mV 制(跟台架 _SIGNAL_COLS 保持一致:台架数据若上传为 V 制,这里不主动转,
+                # 因为 aggregate_durability_stats 是按传入 df 口径聚合的。调用方 app.py 先行换算。)
+                row[col] = v
+            if signal in _BENCH_STD_COL_MAP and key_std in rec.index and pd.notna(rec[key_std]):
+                row[_BENCH_STD_COL_MAP[signal]] = float(rec[key_std])
+        rows.append(row)
+
+    def _do() -> Tuple[int, List[int]]:
+        from sqlalchemy import select
+        written = 0
+        ids: List[int] = []
+        with _engine.connect() as conn:
+            for r in rows:
+                conds = [_bench_cycle_stats.c.rig_id == r["rig_id"],
+                         _bench_cycle_stats.c.cycle_id == r["cycle_id"],
+                         _bench_cycle_stats.c.power_point == r["power_point"]]
+                exist = conn.execute(select(_bench_cycle_stats).where(*conds)).fetchone()
+                if exist is None:
+                    cur = conn.execute(_bench_cycle_stats.insert().values(**r))
+                    new_id = getattr(cur, "lastrowid", None)
+                    if new_id is None:
+                        exist2 = conn.execute(
+                            select(_bench_cycle_stats).where(*conds)).fetchone()
+                        if exist2 is not None:
+                            new_id = dict(exist2._mapping).get("id")
+                    if new_id is not None:
+                        ids.append(int(new_id))
+                    written += 1
+                else:
+                    exist_d = dict(exist._mapping)
+                    ids.append(int(exist_d.get("id")))
+                    upd = {k: v for k, v in r.items()
+                           if v is not None and k not in ("rig_id", "cycle_id", "power_point")}
+                    if upd:
+                        conn.execute(
+                            _bench_cycle_stats.update().where(*conds).values(**upd))
+                        written += 1
+            conn.commit()
+        return written, ids
+
+    try:
+        cnt, ids = _run_with_fallback("db_write_bench_cycle_stats", _do)
+        logger.info(
+            "[落库C1] ✅ rig=%s src=%s rows=%d 写入/更新=%d,ids=%s",
+            rig_id, source_file_name or "(空)", len(rows), cnt,
+            f"[{ids[0]},…,{ids[-1]}]" if len(ids) > 3 else ids)
+        return cnt, list(ids)
+    except Exception as e:
+        logger.error("[落库C1] ❌ rig=%s src=%s err=%s", rig_id, source_file_name, e, exc_info=True)
+        raise
+
+
+def db_load_bench_cycle_stats(
+    rig_id: Optional[str] = None,
+    cycle_from: Optional[int] = None,
+    cycle_to: Optional[int] = None,
+) -> pd.DataFrame:
+    """把 C1 拉回成与 aggregate_durability_stats 近似对齐的长表(列含 <sig>_mean / <sig>_std / 质量标记/数据量)。
+    台架 Tab 能直接用。
+    """
+    from sqlalchemy import select
+    t = _bench_cycle_stats
+
+    def _do() -> pd.DataFrame:
+        stmt = select(t)
+        if rig_id:
+            stmt = stmt.where(t.c.rig_id == rig_id)
+        if cycle_from is not None:
+            stmt = stmt.where(t.c.cycle_id >= int(cycle_from))
+        if cycle_to is not None:
+            stmt = stmt.where(t.c.cycle_id <= int(cycle_to))
+        stmt = stmt.order_by(t.c.cycle_id, t.c.power_point)
+        with _engine.connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+        if not rows:
+            return pd.DataFrame()
+        tmp = pd.DataFrame([dict(r._mapping) for r in rows])
+        # 列名映射回台架聚合格式
+        out = pd.DataFrame({
+            "cycle_id": tmp["cycle_id"].astype(int),
+            "power_point": tmp["power_point"].astype(float),
+            "数据量": tmp.get("data_count"),
+            "质量标记": tmp.get("quality"),
+        })
+        for sig, col in _BENCH_MEAN_COL_MAP.items():
+            if col in tmp.columns:
+                out[f"{sig}_mean"] = tmp[col]
+        for sig, col in _BENCH_STD_COL_MAP.items():
+            if col in tmp.columns:
+                out[f"{sig}_std"] = tmp[col]
+        return out.reset_index(drop=True)
+
+    try:
+        return _run_with_fallback("db_load_bench_cycle_stats", _do)
+    except Exception as e:
+        logger.warning("db_load_bench_cycle_stats 失败: %s", e)
+        return pd.DataFrame()
+
+
+def db_bench_ids_by_event(event: Dict) -> List[int]:
+    """根据预警 event 字典(含 cycle_id+power_point) 查 C1 里匹配的 id, 便于回写 alert_events.bench_cycle_id。"""
+    from sqlalchemy import select
+    if not event:
+        return []
+    cid = event.get("cycle_id")
+    pp = event.get("power_point")
+    if cid is None or pp is None:
+        return []
+
+    def _do() -> List[int]:
+        stmt = select(_bench_cycle_stats.c.id).where(
+            _bench_cycle_stats.c.cycle_id == int(cid),
+            _bench_cycle_stats.c.power_point == float(pp),
+        )
+        with _engine.connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+        return [int(r[0]) for r in rows]
+
+    try:
+        return _run_with_fallback("db_bench_ids_by_event", _do)
+    except Exception as e:
+        logger.warning("db_bench_ids_by_event 失败 cid=%s pp=%s err=%s", cid, pp, e)
+        return []
 
 
 # ---------- alert_push_log CRUD ----------
