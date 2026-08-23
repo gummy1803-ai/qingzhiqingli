@@ -15,6 +15,42 @@ from pathlib import Path
 from .branch_manager import BranchManager, get_branch_manager
 
 
+def _collapse_block(label: str, expanded: bool = False, key_hint: str = ""):
+    """可折叠块: 统一使用 st.expander (禁止在其内部再嵌套 _collapse_block)。
+
+    内部如需折叠效果, 请改用 _safe_sub_collapse (基于 checkbox + 条件渲染的伪折叠)。
+    """
+    safe_key = f"cb_{key_hint}_{hash(label) % 100000}" if key_hint else None
+    return st.expander(label, expanded=expanded)
+
+
+def _safe_sub_collapse(label: str, expanded: bool = False, key_hint: str = ""):
+    """**在 expander 内部禁止再嵌套 st.expander**, 此函数退化为:
+    - 始终渲染的标题 + 缩进容器 (不再提供折叠开关)
+    - 外层已折叠时内层也看不到, 所以不需要双层折叠
+
+    保持 with 语法以最小化改动调用点:
+        with _safe_sub_collapse("标题"):
+            ...
+    """
+    st.markdown(
+        f"<div style='margin:8px 0 2px 0; padding:4px 8px; "
+        f"border-left:3px solid #FFD93D; background:rgba(255,217,61,0.06); "
+        f"font-weight:600; color:#FFD93D;'>{label}</div>",
+        unsafe_allow_html=True,
+    )
+    indent = st.container()
+
+    class _Ctx:
+        def __enter__(self_inner):
+            return indent.__enter__()
+
+        def __exit__(self_inner, *a):
+            return indent.__exit__(*a)
+
+    return _Ctx()
+
+
 def render_branch_management_page():
     """渲染分支管理主页面。"""
     st.title("🌿 分支管理")
@@ -815,7 +851,7 @@ def _render_merge_tab(bm: BranchManager, branches: list, active_branch: str):
             if result.get('conflicts'):
                 st.warning("**⚠️ 存在冲突需要解决:**")
                 for i, conflict in enumerate(result['conflicts']):
-                    with _collapse_block(f"冲突 {i+1}: {conflict['path']}", expanded=False, key_hint=f"merge_conflict_{i}"):
+                    with _safe_sub_collapse(f"冲突 {i+1}: {conflict['path']}", expanded=False, key_hint=f"merge_conflict_{i}"):
                         st.markdown(f"""
                         - **源分支哈希:** `{conflict['source_hash'][:20]}...`
                         - **目标分支哈希:** `{conflict['target_hash'][:20]}...`
