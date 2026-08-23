@@ -2158,71 +2158,76 @@ def render_streamlit_db_status(
     container,  # st.sidebar 或任意 st.container
     position: str = "sidebar",
 ) -> None:
-    """给 Streamlit 页面用的 DB 状态卡片 + 降级警告 + 连接测试。
+    """给 Streamlit 页面用的 DB 状态卡片 + 已入库文件列表。
 
-    - 正常 MySQL: 显示一个 success 提示 (host/db/user)
-    - 降级 SQLite: 醒目 error 横幅提示用户注意
-    - 提供「测试 MySQL 连接」按钮用于诊断
+    - 显示数据库状态(不暴露具体配置)
+    - 显示已入库的数据文件列表
     """
-    info = get_db_backend_info()
-    backend = info["backend"]
+    import streamlit as _st
+    
     with container:
         if position == "sidebar":
-            import streamlit as _st
             _st.divider()
-            _st.subheader("🗄️ 数据库状态")
+            _st.subheader("🗄️ 数据存储")
+        
+        # 数据库状态(不显示具体配置)
+        info = get_db_backend_info()
+        backend = info["backend"]
         
         if "MySQL" in backend:
-            container.success(
-                f"**✅ 后端: MySQL (腾讯云)**\n\n"
-                f"Host: `{info.get('host','')}:{info.get('port','')}`  \n"
-                f"DB: `{info.get('database','')}`  User: `{info.get('user','')}`\n\n"
-                f"数据已持久化存储, 重启不丢失。"
-            )
+            _st.success("✅ 已连接 MySQL (腾讯云)")
         else:
             note = info.get("note", "")
             if note:
-                container.error(
-                    f"**⚠️  当前: SQLite (本地降级)**\n\n"
-                    f"MySQL 不可用, 已自动切换到本地 SQLite。  \n"
-                    f"{note}  \n"
-                    f"文件: `{info.get('path','')}`"
-                )
+                _st.error(f"⚠️ MySQL 不可用, 已降级到 SQLite")
             else:
-                container.warning(
-                    f"**⚠️  当前: SQLite (本地)**\n\n"
-                    f"未检测到 MySQL 配置, 数据存储在本地 SQLite。  \n"
-                    f"⚠️ 注意: Streamlit Cloud 上 SQLite 数据会在重启后丢失!  \n"
-                    f"文件: `{info.get('path','')}`"
-                )
+                _st.warning("⚠️ 使用本地 SQLite (重启会丢失数据)")
         
-        # 显示配置来源信息
-        import streamlit as _st
-        with _st.expander("🔧 数据库配置详情", expanded=False):
-            _st.caption("配置优先级: Streamlit Cloud Secrets > .env 文件")
-            
-            # 显示当前环境变量中的 DB 配置
-            db_keys = ["DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME"]
-            _st.markdown("**当前环境变量配置:**")
-            for k in db_keys:
-                v = os.environ.get(k, "")
-                if k == "DB_PASSWORD":
-                    display = f"{v[:3]}***{v[-3:]}" if len(v) > 6 else "***"
-                else:
-                    display = v if v else "(未设置)"
-                status = "✅" if v else "❌"
-                _st.text(f"  {status} {k} = {display}")
-            
-            # 测试连接按钮
-            if _st.button("🔍 测试 MySQL 连接", type="secondary", use_container_width=True):
-                _st.info("正在测试 MySQL 连接...")
-                result = test_mysql_connection()
-                if result["success"]:
-                    _st.success(f"✅ MySQL 连接成功! 耗时: {result['latency_ms']:.0f}ms")
-                else:
-                    _st.error(f"❌ MySQL 连接失败: {result['error']}")
-                    if result.get("suggestion"):
-                        _st.warning(f"💡 建议: {result['suggestion']}")
+        # 显示已入库文件列表
+        _st.markdown("**📁 已入库数据文件**")
+        try:
+            files = db_list_data_files()
+            if files:
+                # 统计摘要
+                summary = db_get_upload_summary()
+                total = summary.get('total_files', len(files))
+                total_rows = summary.get('total_rows', 0)
+                _st.caption(f"共 {total} 个文件, {total_rows:,} 行数据")
+                
+                # 显示最新10个文件
+                recent_files = files[:10]
+                for f in recent_files:
+                    fname = f.get('filename', 'unknown')
+                    vehicle = f.get('vehicle_id', '')
+                    rows = f.get('row_count', 0)
+                    uploaded = f.get('uploaded_at', '')
+                    if uploaded:
+                        try:
+                            from datetime import datetime
+                            if isinstance(uploaded, datetime):
+                                time_str = uploaded.strftime('%Y-%m-%d %H:%M')
+                            else:
+                                dt = datetime.fromisoformat(str(uploaded))
+                                time_str = dt.strftime('%Y-%m-%d %H:%M')
+                        except:
+                            time_str = str(uploaded)[:16]
+                    else:
+                        time_str = ''
+                    
+                    kind = f.get('data_kind', '')
+                    kind_icon = {'整车': '🚗', '耐久': '⚙️', '台架': '🔬'}.get(kind, '📄')
+                    
+                    if vehicle:
+                        _st.markdown(f"{kind_icon} **{fname}** | {vehicle} | {rows}行 | {time_str}")
+                    else:
+                        _st.markdown(f"{kind_icon} **{fname}** | {rows}行 | {time_str}")
+                
+                if total > 10:
+                    _st.caption(f"... 还有 {total-10} 个文件")
+            else:
+                _st.info("暂无已入库的数据文件, 请上传数据")
+        except Exception as e:
+            _st.caption(f"加载文件列表失败: {str(e)[:50]}")
 
 
 
