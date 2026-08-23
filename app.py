@@ -228,6 +228,7 @@ from utils.helpers import filter_by_time, resample_data, detect_anomalies, SIGNA
 from utils.mock_data import generate_mock_data
 from components.theme import apply_custom_css
 from components.data_quality import render_data_quality
+from components.letter_glitch import render_letter_glitch
 # 燃电性能统计及预测(Tab8)相关模块
 from components.performance_filter import render_performance_filter
 from components.performance_chart import create_performance_figure
@@ -262,7 +263,7 @@ apply_tab_safety_globals()
 
 
 st.set_page_config(
-    page_title="氢质氢离 · 设备测试数据分析与自动报告助手",
+    page_title="设备测试分析助手",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -271,32 +272,41 @@ st.set_page_config(
 # 企业级深色科技主题(全局 CSS 注入,仅需调用一次)
 apply_custom_css()
 
-# 顶部标题栏
-_top_html = """
+# 顶部标题栏 - LetterGlitch 故障风格动画
+render_letter_glitch(
+    glitch_colors=['#2b4539', '#61dca3', '#61b3dc'],
+    glitch_speed=50,
+    center_vignette=True,
+    outer_vignette=False,
+    smooth=True,
+    height=120,
+)
+
+# 标题文字覆盖层
+st.markdown("""
 <div style="
-    display: flex; align-items: center; gap: 16px;
-    padding: 12px 0 20px 0;
-    border-bottom: 1px solid rgba(0,212,255,0.1);
-    margin-bottom: 8px;
+    display: flex; justify-content: center; align-items: center;
+    padding: 16px 0;
+    margin-top: -120px; margin-bottom: 100px;
+    position: relative; z-index: 10;
 ">
-    <div style="
-        width: 44px; height: 44px;
-        background: linear-gradient(135deg, #0096C7, #00D4FF);
-        border-radius: 10px;
-        display: flex; align-items: center; justify-content: center;
-        font-size: 22px; font-weight: 700; color: #0B0E17;
-    ">H2</div>
-    <div>
-        <div style="font-size: 1.25rem; font-weight: 700; color: #00D4FF; letter-spacing: -0.01em;">
-            氢质氢离 · 设备测试数据分析与自动报告助手
-        </div>
-        <div style="font-size: 0.78rem; color: #6B7894; margin-top: 2px;">
-            燃料电池整车数据 / 耐久工步 / 台架循环 · 全流程分析平台
+    <div style="text-align: center;">
+        <div style="
+            font-size: 2.2rem; font-weight: 700;
+            color: #00D4FF;
+            text-shadow: 0 0 20px rgba(0,212,255,0.5), 0 0 40px rgba(0,212,255,0.3);
+            letter-spacing: 0.05em;
+            font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+        ">设备测试分析助手</div>
+        <div style="
+            font-size: 0.9rem; color: #6B7894; margin-top: 8px;
+            letter-spacing: 0.1em;
+        ">
+            Fuel Cell Vehicle Testing Data Analysis Platform
         </div>
     </div>
 </div>
-"""
-st.markdown(_top_html, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 DATA_ROOT = Path(__file__).parent / "企业资料包02_氢质氢离"
 
