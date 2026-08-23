@@ -1974,55 +1974,53 @@ def _render_tab_history() -> None:
         )
 
         if selected_id:
-            sel_id = files[[f.get('file_name') for f in files].index(
-                selected_id.split(" (ID:")[0])]['id'] if " (ID:" in selected_id else None
+            # 从选择项中提取文件名
+            sel_name = selected_id.split(" (ID:")[0] if " (ID:" in selected_id else selected_id
+            sel_file = next((f for f in files if f.get('file_name') == sel_name), None)
+            if sel_file:
+                col1, col2 = st.columns([1, 2])
+                with col1:
+                    st.markdown("**文件信息:**")
+                    st.json({
+                        '类型': sel_file.get('data_kind'),
+                        '车辆': sel_file.get('vehicle_id'),
+                        '文件名': sel_file.get('file_name'),
+                        '行数': sel_file.get('row_count'),
+                        '上传时间': sel_file.get('uploaded_at'),
+                        '状态': sel_file.get('status'),
+                    })
+                with col2:
+                    # 根据类型加载历史数据
+                    kind = sel_file.get('data_kind', '')
+                    vehicle_id = sel_file.get('vehicle_id', '')
 
-            if sel_id:
-                sel_file = next((f for f in files if f['id'] == sel_id), None)
-                if sel_file:
-                    col1, col2 = st.columns([1, 2])
-                    with col1:
-                        st.markdown(f"**文件信息:**")
-                        st.json({
-                            '类型': sel_file.get('data_kind'),
-                            '车辆': sel_file.get('vehicle_id'),
-                            '文件名': sel_file.get('file_name'),
-                            '行数': sel_file.get('row_count'),
-                            '上传时间': sel_file.get('uploaded_at'),
-                            '状态': sel_file.get('status'),
-                        })
-                    with col2:
-                        # 根据类型加载历史数据
-                        kind = sel_file.get('data_kind', '')
-                        vehicle_id = sel_file.get('vehicle_id', '')
-
-                        if kind == '整车' and vehicle_id:
-                            st.markdown(f"**车辆 {vehicle_id} 历史数据:**")
-                            hist_df = db_load_vehicle_minute(vehicle_id)
-                            if len(hist_df) > 0:
-                                st.dataframe(hist_df.head(100), use_container_width=True)
-                                st.caption(f"共 {len(hist_df)} 条分钟数据,显示前 100 条")
-                            else:
-                                st.info("该车辆暂无分钟级数据")
-
-                        elif kind == '耐久工步':
-                            st.markdown("**耐久工步历史数据:**")
-                            dur_df = db_load_durability_stages()
-                            if len(dur_df) > 0:
-                                st.dataframe(dur_df, use_container_width=True)
-                            else:
-                                st.info("暂无耐久工步数据")
-
-                        elif kind == '台架循环':
-                            st.markdown("**台架循环历史数据:**")
-                            bench_df = db_load_bench_cycle_stats()
-                            if len(bench_df) > 0:
-                                st.dataframe(bench_df, use_container_width=True)
-                            else:
-                                st.info("暂无台架循环数据")
-
+                    if kind == '整车' and vehicle_id:
+                        st.markdown(f"**车辆 {vehicle_id} 历史数据:**")
+                        hist_df = db_load_vehicle_minute(vehicle_id)
+                        if len(hist_df) > 0:
+                            st.dataframe(hist_df.head(100), use_container_width=True)
+                            st.caption(f"共 {len(hist_df)} 条分钟数据,显示前 100 条")
                         else:
-                            st.info("暂无可回看的数据类型")
+                            st.info("该车辆暂无分钟级数据")
+
+                    elif kind == '耐久工步':
+                        st.markdown("**耐久工步历史数据:**")
+                        dur_df = db_load_durability_stages()
+                        if len(dur_df) > 0:
+                            st.dataframe(dur_df, use_container_width=True)
+                        else:
+                            st.info("暂无耐久工步数据")
+
+                    elif kind == '台架循环':
+                        st.markdown("**台架循环历史数据:**")
+                        bench_df = db_load_bench_cycle_stats()
+                        if len(bench_df) > 0:
+                            st.dataframe(bench_df, use_container_width=True)
+                        else:
+                            st.info("暂无台架循环数据")
+
+                    else:
+                        st.info("暂无可回看的数据类型")
 
     # 统计信息
     st.divider()
