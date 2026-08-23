@@ -9,6 +9,7 @@
 """
 
 import hashlib
+import logging
 import os
 import shutil
 import time
@@ -16,6 +17,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 class BranchManager:
@@ -31,6 +34,7 @@ class BranchManager:
             base_path = Path(__file__).parent.parent / ".branches"
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
+        logger.info("[分支管理] 初始化: 基础路径=%s", self.base_path)
         self._initialize_default_branch()
     
     def _initialize_default_branch(self):
@@ -121,11 +125,17 @@ class BranchManager:
         Returns:
             (成功标志, 消息)
         """
+        t0 = time.perf_counter()
+        logger.info("[分支创建] 请求: name=%s, source=%s, desc=%s", 
+                    branch_name, source_branch, description[:50])
+        
         if not branch_name or not branch_name.replace("-", "").replace("_", "").isalnum():
+            logger.warning("[分支创建] 失败: 分支名无效 '%s'", branch_name)
             return False, "分支名只能包含字母、数字、-、_ 字符"
         
         branch_path = self._get_branch_path(branch_name)
         if branch_path.exists():
+            logger.warning("[分支创建] 失败: 分支 '%s' 已存在", branch_name)
             return False, f"分支 '{branch_name}' 已存在"
         
         try:
@@ -133,7 +143,12 @@ class BranchManager:
                 # 从源分支复制文件
                 source_path = self._get_branch_path(source_branch)
                 if not source_path.exists():
+                    logger.error("[分支创建] 失败: 源分支 '%s' 不存在", source_branch)
                     return False, f"源分支 '{source_branch}' 不存在"
+                
+                file_count = sum(1 for f in source_path.rglob("*") if f.is_file())
+                logger.info("[分支创建] Fork: 从 '%s' 复制 %d 个文件到 '%s'", 
+                           source_branch, file_count, branch_name)
                 shutil.copytree(source_path, branch_path)
                 self._create_branch_metadata(
                     branch_name,
@@ -142,7 +157,10 @@ class BranchManager:
                     parent_branch=source_branch
                 )
                 self._add_version_record(branch_name, "create", 
-                    f"从分支 '{source_branch}' 创建", 0)
+                    f"从分支 '{source_branch}' 创建", file_count)
+                elapsed = (time.perf_counter() - t0) * 1000
+                logger.info("[分支创建] 成功: '%s' (fork自'%s', %d文件, %.1fms)", 
+                           branch_name, source_branch, file_count, elapsed)
                 return True, f"成功创建分支 '{branch_name}' (来源于 '{source_branch}')"
             else:
                 # 创建空分支
@@ -151,8 +169,12 @@ class BranchManager:
                     branch_name, description, is_active=False
                 )
                 self._add_version_record(branch_name, "create", "创建空分支", 0)
+                elapsed = (time.perf_counter() - t0) * 1000
+                logger.info("[分支创建] 成功: 空分支 '%s' (%.1fms)", branch_name, elapsed)
                 return True, f"成功创建空分支 '{branch_name}'"
         except Exception as e:
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.error("[分支创建] 异常: '%s' -> %s (%.1fms)", branch_name, str(e), elapsed)
             return False, f"创建分支失败: {str(e)}"
     
     def switch_branch(self, branch_name: str) -> Tuple[bool, str]:
@@ -252,31 +274,46 @@ class BranchManager:
         Returns:
             (成功, 消息, 文件哈希)
         """
+        t0 = time.perf_counter()
         branch_path = self._get_branch_path(branch_name)
         if not branch_path.exists():
+            logger.error("[文件添加] 失败: 分支 '%s' 不存在", branch_name)
             return False, f"分支 '{branch_name}' 不存在", ""
         
         if target_name is None:
             target_name = Path(file_path).name
         
         target_path = branch_path / target_name
+        source_size = len(file_content) if file_content else (Path(file_path).stat().st_size if Path(file_path).exists() else 0)
+        
+        logger.info("[文件添加] 请求: branch=%s, target=%s, size=%dKB", 
+                    branch_name, target_name, source_size // 1024)
         
         try:
             if file_content is not None:
                 with open(target_path, "wb") as f:
                     f.write(file_content)
+                logger.info("[文件添加] 写入: %dKB 内容到 %s", source_size // 1024, target_path)
             else:
                 source = Path(file_path)
                 if source.exists():
                     shutil.copy2(source, target_path)
+                    logger.info("[文件添加] 复制: %s -> %s", source, target_path)
                 else:
+                    logger.error("[文件添加] 失败: 源文件不存在 %s", file_path)
                     return False, f"源文件不存在: {file_path}", ""
             
             file_hash = self._compute_file_hash(target_path)
+            file_size = target_path.stat().st_size
             self._add_version_record(branch_name, "commit", 
                 f"添加文件: {target_name}", 1)
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.info("[文件添加] 成功: %s (branch=%s, hash=%s..., size=%dKB, %.1fms)", 
+                       target_name, branch_name, file_hash[:16], file_size // 1024, elapsed)
             return True, f"文件 '{target_name}' 已添加到分支 '{branch_name}'", file_hash
         except Exception as e:
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.error("[文件添加] 异常: %s -> %s (%.1fms)", file_path, str(e), elapsed)
             return False, f"添加文件失败: {str(e)}", ""
     
     def remove_file(self, branch_name: str, file_name: str) -> Tuple[bool, str]:
