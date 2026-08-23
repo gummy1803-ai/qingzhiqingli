@@ -373,10 +373,13 @@ _vehicle_data_files = Table(
            comment="uploaded/aggregated/failed"),
     Column("status_note", Text, default=""),
     Column("agg_rows", Integer, default=0, comment="聚合后入明细行数"),
+    Column("display_order", Integer, nullable=True,
+           comment="用户自定义显示顺序(小=靠前, NULL按上传时间倒序)"),
     Column("extra_meta", _SQLA_JSON, comment="耐久sample/台架rig等额外元"),
     Index("idx_vdf_vehicle", "vehicle_id"),
     Index("idx_vdf_kind", "data_kind"),
     Index("idx_vdf_uploaded", "uploaded_at"),
+    Index("idx_vdf_disp_order", "display_order"),
     mysql_engine="InnoDB",
     mysql_charset="utf8mb4",
     mysql_collate="utf8mb4_unicode_ci",
@@ -682,6 +685,9 @@ def init_db() -> None:
 _SCHEMA_MIGRATIONS: List[Tuple[str, str, Column]] = [
     ("alert_events", "bench_cycle_id",
      Column("bench_cycle_id", Integer)),
+    ("vehicle_data_files", "display_order",
+     Column("display_order", Integer, nullable=True,
+            comment="用户自定义显示顺序(小=靠前, NULL=按上传时间倒序)")),
 ]
 
 
@@ -747,6 +753,44 @@ def _apply_schema_migrations(engine) -> None:
         len(_SCHEMA_MIGRATIONS), _applied, _skipped, _failed,
         (time.perf_counter() - t0) * 1000,
     )
+    # ---- 补列后: 对 display_order 为 NULL 的旧记录,按 uploaded_at 分配初始顺序号 ----
+    try:
+        _assign_display_order_for_nulls(engine)
+    except Exception as _e:
+        logger.warning("[DB 迁移] ⚠ 初始化 display_order 失败(不阻塞主流程): %s", _e)
+
+
+def _assign_display_order_for_nulls(engine) -> int:
+    """给 vehicle_data_files 里 display_order 为 NULL 的记录按上传时间倒序分配顺序号。
+    返回被更新的行数。只在迁移后 & 用户第一次点击上移/下移时调用兜底。"""
+    from sqlalchemy import select, bindparam
+    t = _vehicle_data_files
+    with engine.connect() as conn:
+        # 先拿所有 NULL 行,按 uploaded_at DESC 排序(老顺序)
+        rows_null = conn.execute(
+            select(t.c.id).where(t.c.display_order.is_(None))
+            .order_by(t.c.uploaded_at.desc(), t.c.id.desc())
+        ).fetchall()
+        if not rows_null:
+            return 0
+        ids = [r[0] for r in rows_null]
+        # 给当前已存在 display_order 的记录拿 max 值,避免冲突
+        max_row = conn.execute(
+            select(func.coalesce(func.max(t.c.display_order), 0))
+            .where(t.c.display_order.isnot(None))
+        ).fetchone()
+        start = (max_row[0] or 0) + 1
+        updates = [{"bid": fid, "disp": start + i} for i, fid in enumerate(ids)]
+        if updates:
+            upd_stmt = (
+                t.update().where(t.c.id == bindparam("bid"))
+                .values(display_order=bindparam("disp"))
+            )
+            conn.execute(upd_stmt, updates)
+            conn.commit()
+            logger.info("[DB 迁移] ✅ 为 %d 条旧记录初始化 display_order(起始=%d)",
+                        len(ids), start)
+        return len(ids)
 
 
 def _rows_to_list(rows) -> List[Dict[str, Any]]:
@@ -1267,12 +1311,16 @@ def db_upsert_data_file(
 
 
 def db_list_data_files(data_kind: Optional[str] = None) -> List[Dict]:
-    from sqlalchemy import select
+    from sqlalchemy import select, case
     def _do() -> List[Dict]:
         stmt = select(_vehicle_data_files)
         if data_kind:
             stmt = stmt.where(_vehicle_data_files.c.data_kind == data_kind)
-        stmt = stmt.order_by(_vehicle_data_files.c.uploaded_at.desc())
+        # 排序: display_order 小的排前面(NULL 放最后), display_order 同/NULL 按 uploaded_at DESC
+        disp = _vehicle_data_files.c.display_order
+        order_nulls_last = case((disp.is_(None), 1), else_=0)
+        stmt = stmt.order_by(order_nulls_last.asc(), disp.asc(),
+                             _vehicle_data_files.c.uploaded_at.desc())
         with _engine.connect() as conn:
             rows = conn.execute(stmt).fetchall()
         return _rows_to_list(rows)
@@ -1391,13 +1439,16 @@ def db_list_data_files_paginated(
     offset: int = 0,
 ) -> List[Dict]:
     """分页获取上传文件列表(用于前端展示)。"""
-    from sqlalchemy import select
+    from sqlalchemy import select, case
 
     def _do() -> List[Dict]:
         stmt = select(_vehicle_data_files)
         if data_kind:
             stmt = stmt.where(_vehicle_data_files.c.data_kind == data_kind)
-        stmt = stmt.order_by(_vehicle_data_files.c.uploaded_at.desc())
+        disp = _vehicle_data_files.c.display_order
+        order_nulls_last = case((disp.is_(None), 1), else_=0)
+        stmt = stmt.order_by(order_nulls_last.asc(), disp.asc(),
+                             _vehicle_data_files.c.uploaded_at.desc())
         stmt = stmt.limit(limit).offset(offset)
         with _engine.connect() as conn:
             rows = conn.execute(stmt).fetchall()
@@ -1610,6 +1661,114 @@ def db_delete_data_file(file_id: int, *, op_user: str = "ui") -> Tuple[bool, str
             file_id_i, e, cost, exc_info=True,
         )
         return False, f"删除失败: {_extract_error_summary(e)}"
+
+
+# =========================================================================
+# A1+ · 文件显示顺序(移动/上下移/批量重置)
+# =========================================================================
+def db_ensure_display_order(data_kind: Optional[str] = None) -> int:
+    """兜底: 给 display_order 为 NULL 的记录分配顺序号。返回被赋值的行数。"""
+    t0 = time.perf_counter()
+    try:
+        n = _run_with_fallback("db_ensure_display_order",
+                               lambda: _assign_display_order_for_nulls(_engine))
+        cost = (time.perf_counter() - t0) * 1000
+        logger.info("[文件顺序] ✅ 补齐 display_order NULLs=%d kind=%s | 耗时=%.1fms",
+                    n, data_kind or "(全部)", cost)
+        return int(n or 0)
+    except Exception as e:
+        logger.warning("[文件顺序] ⚠️ ensure_display_order 失败: %s", e)
+        return 0
+
+
+def db_swap_data_file_order(file_id_a: int, file_id_b: int) -> Tuple[bool, str]:
+    """交换两个文件的 display_order(用于上下移按钮)。"""
+    import time as _t
+    from sqlalchemy import select
+    t0 = _t.perf_counter()
+    try:
+        a_i, b_i = int(file_id_a), int(file_id_b)
+    except (TypeError, ValueError):
+        return False, f"非法 file_id: {file_id_a}/{file_id_b}"
+    if a_i == b_i:
+        return True, "相同文件,无需交换"
+    logger.info("[文件顺序] 🔄 交换 order: id=%d ↔ id=%d", a_i, b_i)
+
+    def _do() -> Tuple[bool, str]:
+        t = _vehicle_data_files
+        with _engine.connect() as conn:
+            rows = conn.execute(
+                select(t.c.id, t.c.display_order).where(t.c.id.in_([a_i, b_i]))
+            ).fetchall()
+            by_id = {r[0]: r[1] for r in rows}
+            if a_i not in by_id or b_i not in by_id:
+                missing = [x for x in (a_i, b_i) if x not in by_id]
+                return False, f"文件不存在: ID={missing}"
+            # 取当前 order;若为 NULL, 按 999999 + id 作为临时排序(兜底,不会真的写入这么大)
+            oa = by_id[a_i]
+            ob = by_id[b_i]
+            # 第一步:先临时赋值为 -id(保证唯一且不冲突),避免 UNIQUE/覆盖
+            conn.execute(t.update().where(t.c.id == a_i).values(display_order=-(a_i + 1000000)))
+            conn.execute(t.update().where(t.c.id == b_i).values(display_order=-(b_i + 1000000)))
+            # 第二步:交换
+            conn.execute(t.update().where(t.c.id == a_i).values(display_order=ob))
+            conn.execute(t.update().where(t.c.id == b_i).values(display_order=oa))
+            conn.commit()
+        return True, f"已交换 display_order: {oa}↔{ob}"
+
+    try:
+        ok, msg = _run_with_fallback("db_swap_data_file_order", _do)
+        cost = (_t.perf_counter() - t0) * 1000
+        if ok:
+            logger.info("[文件顺序] ✅ %s | 耗时=%.1fms", msg, cost)
+        else:
+            logger.warning("[文件顺序] ⚠️ 交换被拒绝: %s | 耗时=%.1fms", msg, cost)
+        return ok, msg
+    except Exception as e:
+        cost = (_t.perf_counter() - t0) * 1000
+        logger.error("[文件顺序] ❌ 交换异常 err=%s | 耗时=%.1fms", e, cost, exc_info=True)
+        return False, f"交换失败: {_extract_error_summary(e)}"
+
+
+def db_update_display_order_batch(file_ids_ordered: List[int]) -> Tuple[bool, str]:
+    """按传入 id 列表顺序批量重置 display_order(用于撤销 & 批量同步)。
+
+    Args:
+        file_ids_ordered: 新顺序下的 id 列表, [第1个, 第2个, ...]
+    Returns:
+        (是否成功, 说明)
+    """
+    import time as _t
+    from sqlalchemy import bindparam
+    t0 = _t.perf_counter()
+    if not file_ids_ordered:
+        return True, "空列表,无需更新"
+    logger.info("[文件顺序] 🔄 批量重置顺序: %d 条文件", len(file_ids_ordered))
+
+    def _do() -> Tuple[bool, str]:
+        t = _vehicle_data_files
+        payload = [{"bid": int(fid), "disp": i + 1} for i, fid in enumerate(file_ids_ordered)]
+        with _engine.connect() as conn:
+            upd_stmt = (
+                t.update().where(t.c.id == bindparam("bid"))
+                .values(display_order=bindparam("disp"))
+            )
+            conn.execute(upd_stmt, payload)
+            conn.commit()
+        return True, f"已为 {len(payload)} 条文件重新编号(1..{len(payload)})"
+
+    try:
+        ok, msg = _run_with_fallback("db_update_display_order_batch", _do)
+        cost = (_t.perf_counter() - t0) * 1000
+        if ok:
+            logger.info("[文件顺序] ✅ %s | 耗时=%.1fms", msg, cost)
+        else:
+            logger.warning("[文件顺序] ⚠️ 批量重置被拒绝: %s | 耗时=%.1fms", msg, cost)
+        return ok, msg
+    except Exception as e:
+        cost = (_t.perf_counter() - t0) * 1000
+        logger.error("[文件顺序] ❌ 批量重置异常 err=%s | 耗时=%.1fms", e, cost, exc_info=True)
+        return False, f"批量重置失败: {_extract_error_summary(e)}"
 
 
 # =========================================================================
@@ -2446,120 +2605,6 @@ def test_mysql_connection() -> dict:
         logger.error("[MySQL测试] 未知错误: %s", str(e))
     
     return result
-
-
-def render_streamlit_db_status(
-    container,  # st.sidebar 或任意 st.container
-    position: str = "sidebar",
-) -> None:
-    """给 Streamlit 页面用的 DB 状态卡片 + 已入库文件列表。
-
-    - 显示数据库状态(不暴露具体配置)
-    - 显示已入库的数据文件列表
-    """
-    import streamlit as _st
-    
-    with container:
-        if position == "sidebar":
-            _st.divider()
-            _st.subheader("🗄️ 数据存储")
-        
-        # 数据库状态(不显示具体配置)
-        info = get_db_backend_info()
-        backend = info["backend"]
-        
-        if "MySQL" in backend:
-            _st.success("✅ 已连接 MySQL (腾讯云)")
-        else:
-            note = info.get("note", "")
-            if note:
-                _st.error(f"⚠️ MySQL 不可用, 已降级到 SQLite")
-            else:
-                _st.warning("⚠️ 使用本地 SQLite (重启会丢失数据)")
-        
-        # 显示已入库文件列表
-        _st.markdown("**📁 已入库数据文件**")
-        try:
-            files = db_list_data_files()
-            if files:
-                # 统计摘要
-                summary = db_get_upload_summary()
-                total = summary.get('total_files', len(files))
-                total_rows = summary.get('total_rows', 0)
-                _st.caption(f"共 {total} 个文件, {total_rows:,} 行数据")
-                
-                # 显示最新10个文件 (每行带操作: 删除 / 重命名)
-                recent_files = files[:10]
-                for f in recent_files:
-                    file_id = f.get('id', 0)
-                    fname = f.get('filename', 'unknown')
-                    vehicle = f.get('vehicle_id', '')
-                    rows = f.get('row_count', 0)
-                    uploaded = f.get('uploaded_at', '')
-                    if uploaded:
-                        try:
-                            from datetime import datetime
-                            if isinstance(uploaded, datetime):
-                                time_str = uploaded.strftime('%Y-%m-%d %H:%M')
-                            else:
-                                dt = datetime.fromisoformat(str(uploaded))
-                                time_str = dt.strftime('%Y-%m-%d %H:%M')
-                        except:
-                            time_str = str(uploaded)[:16]
-                    else:
-                        time_str = ''
-                    
-                    kind = f.get('data_kind', '')
-                    kind_icon = {'整车': '🚗', '耐久': '⚙️', '台架': '🔬'}.get(kind, '📄')
-                    safe_key = f"dsop_{file_id}"
-                    
-                    with _st.container(border=True):
-                        info_col, op_col = _st.columns([4, 1])
-                        with info_col:
-                            if vehicle:
-                                _st.markdown(f"{kind_icon} **{fname}** | {vehicle} | {rows}行 | {time_str}")
-                            else:
-                                _st.markdown(f"{kind_icon} **{fname}** | {rows}行 | {time_str}")
-                        with op_col:
-                            op = _st.selectbox(
-                                "操作", ["", "✏️重命名", "🗑️删除"],
-                                key=safe_key, label_visibility="collapsed"
-                            )
-                        
-                        if op == "✏️重命名":
-                            new_name = _st.text_input(
-                                "新文件名", value=fname,
-                                key=f"dsrn_{file_id}"
-                            )
-                            if _st.button("✅ 确认重命名", key=f"dsrnbtn_{file_id}", use_container_width=True):
-                                ok, msg = db_rename_data_file(file_id, new_name)
-                                if ok:
-                                    _st.success(msg)
-                                    _st.rerun()
-                                else:
-                                    _st.error(msg)
-                        
-                        elif op == "🗑️删除":
-                            confirm = _st.checkbox(
-                                f"确认删除 `{fname}`?",
-                                key=f"dsdelchk_{file_id}"
-                            )
-                            if _st.button("🗑️ 执行删除", key=f"dsdelbtn_{file_id}", 
-                                         type="primary", use_container_width=True,
-                                         disabled=not confirm):
-                                ok, msg = db_delete_data_file(file_id)
-                                if ok:
-                                    _st.success(msg)
-                                    _st.rerun()
-                                else:
-                                    _st.error(msg)
-                
-                if total > 10:
-                    _st.caption(f"... 还有 {total-10} 个文件")
-            else:
-                _st.info("暂无已入库的数据文件, 请上传数据")
-        except Exception as e:
-            _st.caption(f"加载文件列表失败: {str(e)[:50]}")
 
 
 # ---------- 辅助解析: 对外暴露 parse_csv_filename (供 BranchManager._persist_business_file 复用) ----------

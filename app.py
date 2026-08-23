@@ -37,7 +37,6 @@ logger = logging.getLogger(__name__)
 from durability import database as _db_module
 from durability.database import (
     init_db as _db_init,
-    render_streamlit_db_status,
     print_console_db_status,
     get_db_backend_info,
     # ===== 新增:落库写入 A1/B1/C1 =====
@@ -57,10 +56,13 @@ from durability.database import (
     db_get_upload_summary,
     db_list_data_files_paginated,
     db_list_data_files,
-    # ===== 上传历史: 删除 / 重命名 =====
+    # ===== 上传历史: 删除 / 重命名 / 重排 =====
     db_delete_data_file,
     db_rename_data_file,
     db_get_data_file,
+    db_ensure_display_order,
+    db_swap_data_file_order,
+    db_update_display_order_batch,
 )
 # 启动期 DB 初始化 (MySQL 不可达自动降级 SQLite)
 _db_init()
@@ -380,11 +382,15 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     # 数据来源: 紧凑布局(移除路径/冗余说明)
+    # NOTE: 这里的取值 "使用内置数据(自动扫描)" / "上传文件"
+    #       必须与后续所有 use_builtin 判断分支完全一致,否则会出现数据不加载的问题
     use_builtin = st.radio(
         "数据来源",
-        ["使用内置数据", "上传文件"],
+        ["使用内置数据(自动扫描)", "上传文件"],
         index=0,
         label_visibility="visible",
+        help=("① 使用内置数据: 无需上传,自动加载 企业资料包02_氢质氢离/ 下三个子目录里的样例数据(开箱即用)\n"
+              "② 上传文件: 拖拽你自己的 CSV/Word/Excel 进来,系统自动识别数据类型并分析")
     )
 
     uploaded_files = None
@@ -423,18 +429,13 @@ with st.sidebar:
     from components.branch_ui import render_sidebar_file_structure
     render_sidebar_file_structure()
 
-    st.divider()
-
-    # ✅ 侧边栏: 已入库数据文件 (带删除/重命名)
-    render_streamlit_db_status(st.sidebar)
-
 
 # ---------- 数据装载 ----------
 
 import io  # 文件上传 BytesIO 处理
 
 data: dict[str, pd.DataFrame] = {}
-if use_builtin == "使用内置数据":
+if use_builtin == "使用内置数据(自动扫描)":
     data = load_default_csvs()
 
 
@@ -1082,8 +1083,25 @@ def _detect_data_type_tags(df: pd.DataFrame) -> set[str]:
 
 _recognized: list[dict] = []
 
+# ------- 先算一下各数据源标记(用于卡片里"数据源"字段) -------
+def _merge_source_tags(tags_list: list[str]) -> str:
+    """去重并按固定顺序拼接来源标签(📦内置 → 📤上传 → 💾DB回填)。"""
+    order = {"📦 内置样例": 0, "📤 上传文件": 1, "💾 数据库回填": 2}
+    uniq = []
+    for t in tags_list:
+        if t and t not in uniq:
+            uniq.append(t)
+    uniq.sort(key=lambda t: order.get(t, 99))
+    return " + ".join(uniq) if uniq else "未知来源"
+
 # ---------- ① 整车数据 ----------
 if bool(data):
+    _v_tags = []
+    if use_builtin == "使用内置数据(自动扫描)":
+        _v_tags.append("📦 内置样例")
+    if bool(uploaded_files):
+        _v_tags.append("📤 上传文件")
+    # 冷启动回填的 DB 数据会在 data 为空时才触发,所以这里不用单独判断
     _total_rows = sum(int(len(v)) for v in data.values())
     _recognized.append({
         "kind": "整车数据",
@@ -1092,11 +1110,21 @@ if bool(data):
         "summary": f"{len(cars)} 辆车 · 合计 {_total_rows:,} 行",
         "emoji": "🚗",
         "extra_tabs": ["⚡ 燃电运行看板", "📈 性能统计预测", "趋势预测", "🔌 绝缘阻值统计", "报告导出", "AI 助手", "多车对比"],
+        "source": _merge_source_tags(_v_tags),
     })
 
 # ---------- ② 耐久工步数据(docx) ----------
 _dur_工步_tags = _detect_data_type_tags(dur_df)
 if dur_df is not None and len(dur_df) > 0 and ("耐久工步" in _dur_工步_tags or "stage_start_h" in (dur_df.columns if dur_df is not None else []) or "平均单体电压(V)" in (dur_df.columns if dur_df is not None else [])):
+    _d_tags = []
+    # 内置耐久:用了 load_default_durability() 说明走了内置分支
+    if use_builtin == "使用内置数据(自动扫描)":
+        _d_tags.append("📦 内置样例")
+    if docx_parts:
+        _d_tags.append(f"📤 上传文件({len(docx_parts)}份)")
+    if (_hydrated_dur is not None and not _hydrated_dur.empty
+            and not docx_parts and use_builtin != "使用内置数据(自动扫描)"):
+        _d_tags.append("💾 数据库回填")
     _n_stages = int(dur_df["stage"].nunique()) if "stage" in dur_df.columns else 0
     _recognized.append({
         "kind": "耐久工步数据",
@@ -1104,6 +1132,7 @@ if dur_df is not None and len(dur_df) > 0 and ("耐久工步" in _dur_工步_tag
         "tab_name": "耐久衰减",
         "summary": f"{len(dur_df):,} 条工步 · {_n_stages} 个阶段",
         "emoji": "📉",
+        "source": _merge_source_tags(_d_tags),
     })
 
 # ---------- ③ 台架循环数据(上传的无 Timestamp CSV/Excel 若命中台架关键词) ----------
@@ -1120,6 +1149,7 @@ if _bench_parts_total_rows > 0:
         "tab_name": "🔬 台架耐久统计及预警",
         "summary": f"{_bench_parts_total_rows:,} 行循环数据",
         "emoji": "🏭",
+        "source": "📤 上传文件",
     })
 # 内置台架目录的CSV也算
 import os as _os
@@ -1133,39 +1163,207 @@ if _bench_builtin_dir.exists() and use_builtin == "使用内置数据(自动扫�
             "tab_name": "🔬 台架耐久统计及预警",
             "summary": f"内置 {len(_bench_csvs)} 份 CSV (进入 Tab 加载)",
             "emoji": "🏭",
+            "source": "📦 内置样例",
         })
 
 if _recognized:
     # ---------- 11 个 Tab 的固定顺序与索引(用于引导提示第几个) ----------
-    # 顺序必须与 st.tabs(...) 完全一致:前4=企业核心功能,后7=补充功能
     _TAB_ORDER = ["⚡ 燃电运行看板", "📈 性能统计预测", "🔌 绝缘阻值统计",
                   "🔬 台架耐久统计及预警",
                   "整车看板", "耐久衰减", "趋势预测", "多车对比", "报告导出",
                   "AI 助手", "📡 飞书人员对接"]
 
-    _jump_card = st.container(border=True)
-    with _jump_card:
-        st.markdown("### 📌 已自动识别数据类型 · 点按钮后看上方 👆 标签栏")
-        _cols = st.columns(min(len(_recognized), 3))
+    def _simplify_dir(raw_dir: str) -> str:
+        """去掉目录名前缀编号(如 '02_整车数据处理'→'整车数据处理'),保持简洁。"""
+        import re
+        return re.sub(r"^\d+[_-]\s*", "", str(raw_dir or "")).strip() or str(raw_dir)
+
+    # ---------- 识别结果卡片的 CSS(企业级卡片风格, 列高等宽) ----------
+    st.markdown("""<style>
+    .rec-card-wrap { display: flex; gap: 18px; }
+    .rec-card {
+        flex: 1; display: flex; flex-direction: column;
+        background: linear-gradient(160deg, rgba(20,30,55,0.85) 0%, rgba(15,22,42,0.92) 100%);
+        border: 1px solid rgba(120,160,220,0.18);
+        border-radius: 14px;
+        padding: 22px 22px 10px 22px;
+        min-height: 300px;
+        transition: border-color .2s ease, transform .2s ease, box-shadow .2s ease;
+        box-shadow: 0 6px 22px rgba(0,0,0,0.28);
+    }
+    .rec-card:hover {
+        border-color: rgba(0,212,255,0.45);
+        transform: translateY(-2px);
+        box-shadow: 0 10px 32px rgba(0,0,0,0.38);
+    }
+    .rec-card-header {
+        display: flex; align-items: center; gap: 12px;
+        padding-bottom: 14px; margin-bottom: 16px;
+        border-bottom: 1px solid rgba(120,160,220,0.14);
+    }
+    .rec-card-icon {
+        width: 44px; height: 44px; border-radius: 10px;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 22px; background: rgba(0,212,255,0.08);
+        border: 1px solid rgba(0,212,255,0.22); flex-shrink: 0;
+    }
+    .rec-card-title {
+        font-size: 1.15rem; font-weight: 700; color: #E6EEFB;
+        font-family: 'Segoe UI','Microsoft YaHei',sans-serif; letter-spacing: 0.01em;
+    }
+    .rec-summary-pill {
+        display: inline-block; margin: 0 0 14px 0;
+        padding: 6px 12px; border-radius: 999px;
+        background: rgba(0,212,255,0.08);
+        border: 1px solid rgba(0,212,255,0.22);
+        color: #7FE4FF; font-size: 0.84rem; font-weight: 600;
+        letter-spacing: 0.01em;
+    }
+    .rec-field {
+        display: flex; gap: 10px; padding: 7px 0;
+        font-size: 0.88rem; line-height: 1.55;
+    }
+    .rec-field-label {
+        min-width: 62px; color: #7B88A6;
+        font-weight: 600; flex-shrink: 0;
+    }
+    .rec-field-value { color: #C9D4EA; word-break: break-all; }
+    .rec-field-value code {
+        background: rgba(120,160,220,0.08);
+        border: 1px solid rgba(120,160,220,0.14);
+        color: #B8C5E0; padding: 1px 6px; border-radius: 4px;
+        font-size: 0.8rem;
+    }
+    .rec-tab-tag {
+        display: inline-block; padding: 2px 9px; border-radius: 6px;
+        background: rgba(94,234,212,0.08);
+        border: 1px solid rgba(94,234,212,0.28);
+        color: #5EEAD4; font-size: 0.78rem; font-weight: 600; margin: 0 4px 4px 0;
+    }
+    .rec-tab-tag.main {
+        background: rgba(0,212,255,0.12);
+        border-color: rgba(0,212,255,0.38);
+        color: #00E0FF;
+    }
+    .rec-card-body { flex: 1; }
+    .rec-card-footer { margin-top: 18px; }
+    .rec-header-row {
+        display: flex; align-items: center; justify-content: space-between;
+        margin-bottom: 18px; gap: 16px; flex-wrap: wrap;
+    }
+    .rec-header-title {
+        font-size: 1.5rem; font-weight: 700; color: #00D4FF;
+        letter-spacing: 0.02em;
+        font-family: 'Segoe UI','Microsoft YaHei',sans-serif;
+    }
+    .rec-header-title .pin {
+        display: inline-block; margin-right: 8px;
+        color: #5EEAD4;
+    }
+    .rec-header-sub {
+        color: #7B88A6; font-size: 0.88rem;
+    }
+    .rec-count-pill {
+        padding: 6px 14px; border-radius: 999px;
+        background: rgba(94,234,212,0.08);
+        border: 1px solid rgba(94,234,212,0.28);
+        color: #5EEAD4; font-weight: 600; font-size: 0.84rem;
+        white-space: nowrap;
+    }
+    </style>""", unsafe_allow_html=True)
+
+    _outer = st.container(border=False)
+    with _outer:
+        # ---------- 顶部标题行 ----------
+        _hdr_col1, _hdr_col2 = st.columns([5, 1.3])
+        with _hdr_col1:
+            st.markdown(
+                f'<div class="rec-header-row">'
+                f'  <div>'
+                f'    <div class="rec-header-title"><span class="pin">📌</span>已识别数据类型</div>'
+                f'    <div class="rec-header-sub">自动识别 {len(_recognized)} 类数据源 · 点击卡片下方按钮直接跳转到对应分析 Tab(标签栏位于当前卡片上方)</div>'
+                f'  </div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with _hdr_col2:
+            st.markdown(
+                f'<div style="text-align:right;"><span class="rec-count-pill">共 {len(_recognized)} 类就绪</span></div>',
+                unsafe_allow_html=True,
+            )
+
+        # ---------- 卡片列(严格等宽) ----------
+        _n_cols = max(1, min(len(_recognized), 3))
+        _card_cols = st.columns(_n_cols, gap="medium")
+
         for _i, _r in enumerate(_recognized):
-            with _cols[_i % len(_cols)]:
-                st.markdown(
-                    f"#### {_r['emoji']} {_r['kind']}\n"
-                    f"- 📁 目录: `{_r['dir']}`\n"
-                    f"- 📊 {_r['summary']}\n"
-                    f"- 🎯 主 Tab: **{_r['tab_name']}**"
-                    + (f"\n- 💡 其他可用 Tab: {'、'.join(_r['extra_tabs'])}" if _r.get("extra_tabs") else "")
+            with _card_cols[_i % _n_cols]:
+                _col_tab_tag = f'jump_tag_a_{_r["tab_name"]}_{_i}'
+                _col_summ_html = ""
+                if _r.get("summary"):
+                    _col_summ_html = f'<div class="rec-summary-pill">📊 {_r["summary"]}</div>'
+
+                # --- 主 Tab 标签 + 相关 Tab 标签 ---
+                _main_tab_html = (
+                    f'<span class="rec-tab-tag main">🎯 {_r["tab_name"]}</span>'
+                    if _r.get("tab_name") else ""
                 )
+                _extra_tabs_html = ""
+                if _r.get("extra_tabs"):
+                    _extra_tabs_html = "&nbsp;".join(
+                        f'<span class="rec-tab-tag">{t}</span>' for t in _r["extra_tabs"]
+                    )
+
+                _dir_short = _simplify_dir(_r["dir"])
+                _dir_full = str(_r.get("dir", ""))
+                _source_label = str(_r.get("source") or "📦 内置样例")
+
+                # --- 渲染卡片 HTML(仅展示部分) ---
+                st.markdown(
+                    f'<div class="rec-card">'
+                    f'  <div class="rec-card-header">'
+                    f'    <div class="rec-card-icon">{_r.get("emoji","📦")}</div>'
+                    f'    <div class="rec-card-title">{_r["kind"]}</div>'
+                    f'  </div>'
+                    f'  <div class="rec-card-body">'
+                    f'    {_col_summ_html}'
+                    f'    <div class="rec-field">'
+                    f'      <div class="rec-field-label">数据源</div>'
+                    f'      <div class="rec-field-value"><span class="rec-tab-tag main">{_source_label}</span></div>'
+                    f'    </div>'
+                    f'    <div class="rec-field">'
+                    f'      <div class="rec-field-label">目录</div>'
+                    f'      <div class="rec-field-value" title="{_dir_full}"><code>{_dir_short}</code></div>'
+                    f'    </div>'
+                    f'    <div class="rec-field">'
+                    f'      <div class="rec-field-label">跳转</div>'
+                    f'      <div class="rec-field-value" style="margin-top:-2px;">'
+                    f'        {_main_tab_html}{_extra_tabs_html}'
+                    f'      </div>'
+                    f'    </div>'
+                    f'  </div>'
+                    f'  <div class="rec-card-footer">',
+                    unsafe_allow_html=True,
+                )
+
+                # --- 原生 Streamlit 按钮(放在 footer 区域,保证在底部) ---
                 _btn = st.button(
-                    f"👉 去「{_r['tab_name']}」分析",
+                    f"前往「{_r['tab_name']}」",
                     type="primary",
                     key=f"jump_btn_{_r['tab_name']}_{_i}",
                     use_container_width=True,
                 )
+
+                # 卡片闭合标签
+                st.markdown(
+                    f'  </div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
                 if _btn:
                     _tab_label = _r['tab_name']
                     _tab_idx = _TAB_ORDER.index(_tab_label) + 1 if _tab_label in _TAB_ORDER else "?"
-                    # ASCII 箭头指向目标 Tab 的位置示意图
                     _arrow_bar = "  ".join([f"{'👇' if i+1==_tab_idx else '──'}" for i in range(len(_TAB_ORDER))])
                     _idx_bar  = "  ".join([f"[{i+1}]" for i in range(len(_TAB_ORDER))])
                     st.toast(f"🎯 第 {_tab_idx} 个 Tab「{_tab_label}」→ 看标签栏!", icon="✅")
@@ -1175,8 +1373,7 @@ if _recognized:
                         f"Tab 顺序: {_idx_bar}\n"
                         f"箭头指: {_arrow_bar}\n"
                         f"```\n\n"
-                        f"↑↑↑ 11 个标签就排在当前这段话的正上方,"
-                        f"找到标 🔵「{_tab_label}」的那个直接点一下就行。"
+                        f"↑↑↑ 标签栏就在当前这段话的正上方,找到标 🔵「{_tab_label}」的标签点一下即可。"
                         + (f"\n\n💡 其他相关 Tab: {', '.join(_r['extra_tabs'])}" if _r.get("extra_tabs") else ""),
                         icon="🎯",
                     )
@@ -1935,15 +2132,109 @@ def _cached_data_files(_backend_tag: str, data_kind: str | None, limit: int) -> 
 
 @tab_safe_render
 def _render_tab_history() -> None:
-    """Tab12: 上传历史记录及数据回看(优化版:缓存+按需加载)。"""
+    """Tab12: 上传历史记录及数据回看。
+    - 支持筛选、分页、按类型汇总
+    - 编辑模式下: 行内直接「重命名 / 上下移 / 删除」+ 撤销栈(顺序和文件名可撤回)
+    """
+    from datetime import datetime
+    import time as _time_mod
+
+    kind_icons = {'整车': '🚗', '耐久工步': '📉', '台架循环': '🔬'}
+
+    # ===================== 初始化会话态 =====================
+    if "history_edit_mode" not in st.session_state:
+        st.session_state["history_edit_mode"] = False
+    if "history_undo_stack" not in st.session_state:
+        st.session_state["history_undo_stack"] = []   # List[dict]
+    MAX_UNDO = 50
+    _UNDO_KEY = "history_undo_stack"
+    _EDIT_KEY = "history_edit_mode"
+
+    def _snap(desc: str, files_now: list[dict], op: str) -> None:
+        """操作前打快照,入撤销栈。"""
+        ids_ordered = [int(f.get("id")) for f in files_now if isinstance(f.get("id"), int)]
+        names = {int(f.get("id")): str(f.get("file_name", ""))
+                 for f in files_now if isinstance(f.get("id"), int)}
+        snap = {"op": op, "desc": desc,
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "ids_ordered": ids_ordered, "file_names": names}
+        stack = st.session_state.get(_UNDO_KEY, [])
+        stack.append(snap)
+        if len(stack) > MAX_UNDO:
+            stack = stack[-MAX_UNDO:]
+        st.session_state[_UNDO_KEY] = stack
+        logger.info("[上传历史-快照] %s | 撤销栈深度=%d | %s",
+                    snap["time"], len(stack), desc[:80])
+
+    def _fmt_ts(v):
+        if not v:
+            return "—"
+        try:
+            if isinstance(v, datetime):
+                return v.strftime('%Y-%m-%d %H:%M')
+            if isinstance(v, str):
+                if " " in v and len(v) >= 16:
+                    return v[:16].replace("T", " ")
+                return datetime.fromisoformat(str(v)).strftime('%Y-%m-%d %H:%M')
+        except Exception:
+            pass
+        return str(v)[:16]
+
+    def _status_tag(s: str) -> str:
+        s = (s or "uploaded").lower()
+        m = {"uploaded": ("已上传", "📤"),
+             "aggregated": ("已入库", "✅"),
+             "failed": ("失败", "⚠️")}
+        t, ic = m.get(s, (s or "未知", "📄"))
+        return f"{ic} {t}"
+
+    # ===================== 页面渲染 =====================
+    # --- 标题行(含编辑模式 & 撤销) ---
     st.header("📁 上传历史记录")
-    st.caption("查看所有已上传的数据文件历史,支持按类型筛选和数据回看")
+    st.caption("查看所有已入库的数据文件;开启「编辑模式」可直接 重命名 / 移动位置 / 删除。")
 
+    t1, t2, t3 = st.columns([6, 1.1, 1.1])
+    with t2:
+        edit_mode = st.toggle("✏️ 编辑模式", key="tgl_history_edit",
+                              value=bool(st.session_state.get(_EDIT_KEY, False)))
+        st.session_state[_EDIT_KEY] = edit_mode
+    with t3:
+        undo_stack: list[dict] = st.session_state.get(_UNDO_KEY, [])
+        can_undo = len(undo_stack) > 0
+        if st.button(f"↩️ 撤销 ({len(undo_stack)})", key="history_undo_btn",
+                     disabled=not can_undo, use_container_width=True):
+            snap = undo_stack.pop()
+            st.session_state[_UNDO_KEY] = undo_stack
+            # 撤销:顺序 + 文件名逐项回写
+            order_ok, order_msg = db_update_display_order_batch(snap["ids_ordered"])
+            name_restored = 0
+            name_failed = 0
+            for fid, old_name in snap["file_names"].items():
+                ok_n, _ = db_rename_data_file(int(fid), str(old_name))
+                if ok_n:
+                    name_restored += 1
+                else:
+                    name_failed += 1
+            logger.info("[上传历史-撤销] op=%s desc=%s | order_ok=%s(%s) names_restored=%d failed=%d",
+                        snap.get("op"), snap.get("desc"),
+                        order_ok, order_msg[:40], name_restored, name_failed)
+            # 清缓存
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.toast(f"↩️ 已撤销:「{snap['desc']}」({snap['time']})", icon="♻️")
+            st.info(
+                f"♻️ **撤销完成** →「{snap['desc']}」 ({snap['time']})\n\n"
+                f"- 显示顺序: {'✅ 已还原' if order_ok else '❌ ' + order_msg}\n"
+                f"- 文件名恢复: {name_restored} 条成功 / {name_failed} 条跳过(可能已被级联删除,级联删除不可恢复)"
+            )
+            _time_mod.sleep(0.3)
+            st.rerun()
+
+    # --- 汇总卡片 ---
     _backend = get_db_backend_info().get("backend", "unknown")
-    _tag = f"{_backend}"
-
-    # === 1. 汇总卡片 (30秒缓存) ===
-    summary = _cached_upload_summary(_tag)
+    summary = _cached_upload_summary(f"{_backend}_hist")
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("总文件数", summary['total_files'])
@@ -1959,14 +2250,12 @@ def _render_tab_history() -> None:
     # 按类型分组
     if kinds:
         _cols = st.columns(min(len(kinds), 4))
-        kind_icons = {'整车': '🚗', '耐久工步': '📉', '台架循环': '🔬'}
         for i, (kind, info) in enumerate(kinds.items()):
             with _cols[i % len(_cols)]:
                 icon = kind_icons.get(kind, '📄')
                 st.markdown(f"**{icon} {kind}**")
                 st.caption(f"{info['count']} 个文件 · {info['rows']:,} 行")
 
-    # 按车辆分组
     by_vehicle = summary.get('by_vehicle', {})
     if by_vehicle:
         with st.expander(f"按车辆统计 ({len(by_vehicle)} 辆车)", expanded=False):
@@ -1975,143 +2264,219 @@ def _render_tab_history() -> None:
 
     st.divider()
 
-    # === 2. 文件列表 (30秒缓存) ===
+    # --- 筛选 ---
     filter_col1, filter_col2 = st.columns([2, 1])
     with filter_col1:
         kind_filter = st.selectbox(
             "按类型筛选",
             options=["全部", "整车", "耐久工步", "台架循环"],
             index=0,
-            key="history_kind_filter",
+            key="history_kind_filter_v2",
         )
     with filter_col2:
-        page_size = st.selectbox("每页显示", [10, 20, 50], index=1, key="history_page_size")
+        page_size = st.selectbox("每页显示", [10, 20, 50], index=1, key="history_page_size_v2")
 
     kind_param = None if kind_filter == "全部" else kind_filter
-    files = _cached_data_files(_tag, kind_param, page_size)
+    # 进入页之前先兜底确保 display_order 全有值(避免第一次移动时报 NULL)
+    try:
+        db_ensure_display_order(kind_param)
+    except Exception as _e:
+        logger.warning("[上传历史] ensure_display_order 兜底失败(不阻塞): %s", _e)
+
+    files = _cached_data_files(f"{_backend}_hist", kind_param, page_size)
 
     if not files:
         st.info("暂无上传记录。请前往首页「上传文件」或使用「内置数据」模式导入数据。")
         return
 
-    # 文件列表表格
-    display_df = pd.DataFrame(files)
-    show_cols = ['id', 'data_kind', 'vehicle_id', 'file_name', 'row_count', 'uploaded_at', 'status']
-    show_cols = [c for c in show_cols if c in display_df.columns]
-    display_df = display_df[show_cols]
-    col_names = {
-        'id': 'ID', 'data_kind': '类型', 'vehicle_id': '车辆',
-        'file_name': '文件名', 'row_count': '行数',
-        'uploaded_at': '上传时间', 'status': '状态',
-    }
-    display_df = display_df.rename(columns={k: v for k, v in col_names.items() if k in show_cols})
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    # ===================== 行内操作区(编辑模式) & 简洁卡片区 =====================
+    if edit_mode:
+        st.caption("✏️ **编辑模式**:直接在输入框改文件名(失焦即保存);行尾 ⬆️⬇️ 调位置;🗑️ 级联删除(不可恢复)。")
 
-    # === 2B. 文件管理: 重命名 / 删除 (UI-入库文件操作) ===
-    st.divider()
-    st.subheader("🛠️ 文件管理 (入库记录)")
-    st.caption("选择一个已入库文件进行「重命名」或「删除」。删除会同步清理该车/工步/台架统计中与该文件关联的全部明细数据。")
+    file_ids_now: list[int] = [int(f.get("id")) for f in files]
 
-    mg_col1, mg_col2 = st.columns([1, 2])
-    with mg_col1:
-        mg_opts = [
-            (i, f"[ID:{f.get('id')}] {f.get('file_name','?')} ({f.get('data_kind','')})")
-            for i, f in enumerate(files)
-        ]
-        if not mg_opts:
-            st.info("暂无可操作的文件。请先上传数据。")
-            mg_sel_idx = None
+    # 每个文件一行
+    for idx, f in enumerate(files):
+        fid = int(f.get("id"))
+        kind = f.get("data_kind", "") or "未知"
+        icon = kind_icons.get(kind, "📄")
+        fname_cur = str(f.get("file_name", "?"))
+        vehicle = f.get("vehicle_id", "") or "—"
+        rows = int(f.get("row_count") or 0)
+        uploaded = _fmt_ts(f.get("uploaded_at"))
+        status_s = _status_tag(str(f.get("status", "uploaded")))
+        disp = int(f.get("display_order") or (idx + 1))
+
+        if not edit_mode:
+            # ---------- 非编辑模式: 简洁卡片 ----------
+            with st.container(border=False):
+                c1, c2, c3, c4, c5, c6 = st.columns([0.5, 2.6, 1, 1.1, 1.3, 1])
+                c1.markdown(
+                    f"<div style='text-align:center; font-size:22px;'>{icon}</div>",
+                    unsafe_allow_html=True,
+                )
+                c2.markdown(
+                    f"**{fname_cur}**  \n"
+                    f"<span style='color:#7B88A6;font-size:0.8rem;'>ID: {fid} · 顺序 #{disp}</span>",
+                    unsafe_allow_html=True,
+                )
+                c3.markdown(
+                    f"<span class='rec-tab-tag main' style='margin-top:2px;'>{kind}</span>" if True else kind,
+                    unsafe_allow_html=True,
+                )
+                c4.write(vehicle)
+                c5.write(f"{rows:,} 行")
+                c6.write(uploaded)
         else:
-            mg_sel_idx = st.selectbox(
-                "选择目标文件",
-                options=[i for i, _ in mg_opts],
-                format_func=lambda i: mg_opts[i][1],
-                index=0,
-                key="history_mg_file_selector",
-            )
-    target_file = files[mg_sel_idx] if mg_sel_idx is not None else None
+            # ---------- 编辑模式: 行内操作 ----------
+            with st.container(border=True):
+                # 每行: 编号+上移下移(2col) | 文件元信息(3col) | 重命名输入框(4col) | 删除(1col)
+                oc1, oc2, oc3, oc4, oc5 = st.columns([0.9, 2.4, 1.2, 3.5, 1])
 
-    if target_file is not None:
-        fid = target_file.get("id")
-        fname_cur = target_file.get("file_name", "")
-        with mg_col2:
-            mg_mode = st.radio(
-                "操作类型",
-                ["✏️ 重命名", "🗑️ 删除"],
-                index=0,
-                horizontal=True,
-                key="history_mg_mode",
-            )
-            if mg_mode == "✏️ 重命名":
-                new_name = st.text_input(
-                    "新文件名（含后缀）",
-                    value=fname_cur,
-                    max_chars=512,
-                    key="history_rename_new_name",
-                )
-                confirm_rename = st.checkbox(
-                    f"我确认要将 ID={fid} 的文件重命名为「{new_name}」",
-                    value=False,
-                    key="history_rename_confirm",
-                )
-                if st.button("⚠️ 执行重命名", key="btn_do_rename", type="secondary",
-                             disabled=not confirm_rename):
-                    with st.spinner("正在更新数据库..."):
-                        ok, msg = db_rename_data_file(int(fid), new_name)
+                # --- 列 1: 编号 + 上下移按钮 ---
+                with oc1:
+                    st.markdown(
+                        f"<div style='font-weight:700; color:#00D4FF; margin-top:2px;'>#{disp}</div>"
+                        f"<div style='font-size:0.75rem; color:#7B88A6;'>ID {fid} · {icon}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    mc1, mc2 = st.columns(2)
+                    disabled_up = idx == 0
+                    disabled_down = idx == len(files) - 1
+                    with mc1:
+                        if st.button("⬆️", key=f"hist_up_{fid}", disabled=disabled_up,
+                                     help="上移一位"):
+                            prev_fid = file_ids_now[idx - 1]
+                            _snap(f"上移:文件[{fid}]↔文件[{prev_fid}]", files, "swap_up")
+                            ok, msg = db_swap_data_file_order(fid, prev_fid)
+                            if ok:
+                                logger.info("[上传历史-上移] ✅ id=%d↔id=%d | %s",
+                                            fid, prev_fid, msg)
+                                try:
+                                    st.cache_data.clear()
+                                except Exception:
+                                    pass
+                                st.rerun()
+                            else:
+                                st.error(f"⬆️ 上移失败: {msg}")
+                                logger.warning("[上传历史-上移] ❌ id=%d↔id=%d msg=%s",
+                                               fid, prev_fid, msg)
+                    with mc2:
+                        if st.button("⬇️", key=f"hist_down_{fid}", disabled=disabled_down,
+                                     help="下移一位"):
+                            next_fid = file_ids_now[idx + 1]
+                            _snap(f"下移:文件[{fid}]↔文件[{next_fid}]", files, "swap_down")
+                            ok, msg = db_swap_data_file_order(fid, next_fid)
+                            if ok:
+                                logger.info("[上传历史-下移] ✅ id=%d↔id=%d | %s",
+                                            fid, next_fid, msg)
+                                try:
+                                    st.cache_data.clear()
+                                except Exception:
+                                    pass
+                                st.rerun()
+                            else:
+                                st.error(f"⬇️ 下移失败: {msg}")
+                                logger.warning("[上传历史-下移] ❌ id=%d↔id=%d msg=%s",
+                                               fid, next_fid, msg)
+
+                # --- 列 2: 类型 + 车辆 ---
+                with oc2:
+                    st.markdown(
+                        f"<span class='rec-tab-tag main'>{icon} {kind}</span><br>"
+                        f"<div style='font-size:0.82rem; color:#7B88A6; margin-top:2px;'>"
+                        f"🚙 {vehicle} · {rows:,} 行<br>{uploaded} · {status_s}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                # --- 列 3: 数据规模小提示 ---
+                with oc3:
+                    st.caption(
+                        f"行数\n**{rows:,}**\n\n"
+                        f"状态\n{status_s}"
+                    )
+
+                # --- 列 4: 文件名编辑框(on_change 保存) ---
+                def _do_rename(cur_fid=fid, cur_old=fname_cur):
+                    val = st.session_state.get(f"hist_name_{cur_fid}", cur_old)
+                    new_val = (val or "").strip()
+                    if not new_val:
+                        st.warning(f"文件名不能为空, 已恢复原名: {cur_old}")
+                        st.session_state[f"hist_name_{cur_fid}"] = cur_old
+                        logger.warning("[上传历史-重命名] ⚠️ 文件[%d]拒绝空文件名", cur_fid)
+                        return
+                    if new_val == cur_old:
+                        return
+                    # 重命名前打撤销快照
+                    _snap(f"重命名文件[{cur_fid}]: {cur_old[:30]} → {new_val[:30]}",
+                          files, "rename")
+                    ok, msg = db_rename_data_file(int(cur_fid), new_val)
                     if ok:
-                        st.success(f"✅ {msg}")
-                        # 清缓存并重渲染
+                        logger.info("[上传历史-重命名] ✅ id=%d | %s", cur_fid, msg)
                         try:
                             st.cache_data.clear()
                         except Exception:
                             pass
                         st.rerun()
                     else:
-                        st.error(f"❌ {msg}")
+                        # 失败把输入框值恢复
+                        st.session_state[f"hist_name_{cur_fid}"] = cur_old
+                        logger.warning("[上传历史-重命名] ❌ id=%d 原因=%s",
+                                       cur_fid, msg)
+                        st.error(f"❌ 重命名失败: {msg}")
 
-            else:  # 删除
-                kind = target_file.get("data_kind", "")
-                rows = target_file.get("row_count", 0)
-                vehicle = target_file.get("vehicle_id", "")
-                st.markdown(
-                    f"**待删除信息:**\n\n"
-                    f"- 类型: `{kind}`\n"
-                    f"- 车号: `{vehicle or '(空)'}`\n"
-                    f"- 文件: `{fname_cur}`\n"
-                    f"- 行数: {rows:,}\n\n"
-                    f"⚠️ **级联删除**: 以下关联数据也会同步删除（不可恢复）:\n"
-                    f"- 整车分钟级明细 (vehicle_minute_samples)\n"
-                    f"- 耐久工步数据 (durability_stages)\n"
-                    f"- 台架循环统计 (bench_cycle_stats)\n"
-                    f"- 文件索引本身 (vehicle_data_files)"
-                )
-                confirm_del_text = f"我确认要永久删除 ID={fid} 「{fname_cur}」及其全部关联数据"
-                confirm_del = st.checkbox(
-                    confirm_del_text,
-                    value=False,
-                    key="history_delete_confirm",
-                )
-                confirm_del2 = st.checkbox(
-                    "我已阅读以上风险, 确认删除（不可恢复）",
-                    value=False,
-                    key="history_delete_confirm2",
-                )
-                can_delete = confirm_del and confirm_del2
-                if st.button("🔥 永久删除 (此操作不可撤销)", key="btn_do_delete",
-                             type="primary", disabled=not can_delete):
-                    with st.spinner("正在执行级联删除..."):
-                        ok, msg = db_delete_data_file(int(fid), op_user="streamlit-ui")
-                    if ok:
-                        st.success(f"✅ {msg}")
-                        try:
-                            st.cache_data.clear()
-                        except Exception:
-                            pass
-                        st.rerun()
-                    else:
-                        st.error(f"❌ {msg}")
+                with oc4:
+                    st.text_input(
+                        f"文件名 (ID {fid})",
+                        value=fname_cur,
+                        max_chars=512,
+                        key=f"hist_name_{fid}",
+                        label_visibility="collapsed",
+                        on_change=_do_rename,
+                    )
+                    st.caption("👆 输入文件名后,按回车或点击其他区域(失焦)即保存。")
+
+                # --- 列 5: 删除 ---
+                with oc5:
+                    confirm_del = st.checkbox(
+                        "确认删除", key=f"hist_del_conf_{fid}", value=False,
+                        help="勾选后「🔥删除」按钮才可用,级联删除不可恢复。"
+                    )
+                    if st.button("🔥 删除", key=f"hist_del_btn_{fid}",
+                                 disabled=not confirm_del, type="primary",
+                                 use_container_width=True):
+                        _snap(f"删除文件[{fid}]: {fname_cur[:30]} (顺序#{disp})", files, "delete")
+                        ok, msg = db_delete_data_file(int(fid), op_user="streamlit-history-tab")
+                        if ok:
+                            logger.warning("[上传历史-删除] ⚠️ 已级联删除 id=%d | %s",
+                                           fid, msg)
+                            st.success(f"✅ {msg}")
+                            try:
+                                st.cache_data.clear()
+                            except Exception:
+                                pass
+                            # 清空自己的确认框,避免再点
+                            st.session_state[f"hist_del_conf_{fid}"] = False
+                            st.rerun()
+                        else:
+                            logger.error("[上传历史-删除] ❌ id=%d 原因=%s",
+                                         fid, msg, exc_info=True)
+                            st.error(f"❌ 删除失败: {msg}")
 
     st.divider()
+
+    # --- 编辑模式底部管理区 ---
+    if edit_mode:
+        st.subheader("🛠️ 管理说明")
+        st.markdown(
+            "**修改方式:**\n"
+            "- **重命名:** 改文件名输入框 → 按回车 / 点其他区域就会写入数据库\n"
+            "- **移动(排序):** 每行开头的 ⬆️⬇️ 按钮和相邻文件交换顺序, 改动会持久化到数据库 `display_order` 列, 所有人都会看到新顺序\n"
+            "- **删除:** 先勾「确认删除」再点「🔥删除」, **会同时级联删除该车分钟级/耐久工步/台架统计的关联数据 → 不可恢复**\n\n"
+            "**撤销说明(↩️ 撤销按钮):**\n"
+            "- 可撤销: 重命名、上下移 造成的文件名/显示顺序变化(最多 50 步)\n"
+            "- 无法完全撤销: 删除操作会真实删除数据, 撤销只能还原其他文件的顺序/名称, 已删除的数据无法回来"
+        )
 
     # === 3. 数据回看 (按需加载,不自动查询) ===
     st.subheader("📂 数据回看")
@@ -2386,47 +2751,339 @@ def _render_tab_ai(sel_car_default: str | None = None) -> None:
                     {"role": "assistant", "content": answer})
 
     st.divider()
-    st.subheader("⚡ 快捷问题(按分类点击)")
-    quick_categories = {
-        "🎯 Tab 导航(去哪个)": [
+
+    # ============ ⚡ 快捷问题(支持编辑/移动/删除 + 撤销 + 详细日志) ============
+    DEFAULT_QUICK_CATEGORIES = [
+        {"name": "🎯 Tab 导航(去哪个)", "questions": [
             "想看单体电压+电流双轴曲线,去哪个 Tab?步骤是什么?",
             "上传台架 CSV 后,分析结果在第几个 Tab 看?",
             "我传了个 .docx(耐久工步),应该看哪里?"
-        ],
-        "📊 功能1/2 解读": [
+        ]},
+        {"name": "📊 功能1/2 解读", "questions": [
             "离均差(FC_AvgCellVoltDev)是什么?数值大会有什么影响?",
             "稳态段怎么算出来的?180秒 规则解释一下",
             "燃电极化曲线是什么意思?能判断什么?"
-        ],
-        "🔌 功能3 绝缘": [
+        ]},
+        {"name": "🔌 功能3 绝缘", "questions": [
             "350 kΩ 和 250 kΩ 两条报警线分别是什么含义?",
             "绝缘的有效值是怎么从原始数据算出来的?哪些坏值会被过滤?",
             "绝缘阻值预测触碰报警线多久,是怎么算出来的?"
-        ],
-        "🏭 功能4 台架预警": [
+        ]},
+        {"name": "🏭 功能4 台架预警", "questions": [
             "台架耐久的 6 档标准功率点具体是哪 6 个?",
             "台架触发飞书预警的具体条件是什么?阈值是多少?",
             "飞书预警推送给哪些人?怎么新增/修改联系人?"
-        ],
-    }
-    for cat, questions in quick_categories.items():
-        st.markdown(f"**{cat}**")
-        cols = st.columns(len(questions))
-        for i, q in enumerate(questions):
-            if cols[i].button(q, key=f"q_{cat}_{i}", use_container_width=True):
-                st.session_state.ai_messages.append({"role": "user", "content": q})
-                with st.chat_message("user"):
-                    st.markdown(q)
-                with st.chat_message("assistant"):
-                    with st.spinner("AI 思考中..."):
+        ]},
+    ]
+    MAX_UNDO_HISTORY = 50
+
+    def _deepcopy_categories(src_list: list) -> list:
+        return [
+            {"name": str(c.get("name", "")),
+             "questions": [str(q) for q in (c.get("questions") or [])]}
+            for c in (src_list or [])
+        ]
+
+    if "quick_categories" not in st.session_state:
+        logger.info("[快捷题目] 初始化默认题目: %d 个分类", len(DEFAULT_QUICK_CATEGORIES))
+        st.session_state.quick_categories = _deepcopy_categories(DEFAULT_QUICK_CATEGORIES)
+    if "quick_categories_undo" not in st.session_state:
+        st.session_state.quick_categories_undo = []
+
+    def _snapshot_for_undo(operation_desc: str) -> None:
+        try:
+            snap = _deepcopy_categories(st.session_state.quick_categories)
+            st.session_state.quick_categories_undo.append({
+                "desc": operation_desc,
+                "snapshot": snap,
+                "ts": datetime.now().strftime("%H:%M:%S"),
+            })
+            if len(st.session_state.quick_categories_undo) > MAX_UNDO_HISTORY:
+                dropped = st.session_state.quick_categories_undo.pop(0)
+                logger.info("[快捷题目-撤销栈] 超上限,丢弃最老操作: %s", dropped["desc"])
+            logger.info("[快捷题目-快照] 「%s」入栈 | 撤销栈深度=%d",
+                        operation_desc, len(st.session_state.quick_categories_undo))
+        except Exception as _e:
+            logger.error("[快捷题目-快照] 保存失败 op=%s err=%s", operation_desc, _e, exc_info=True)
+
+    def _do_undo() -> bool:
+        stack = st.session_state.quick_categories_undo
+        if not stack:
+            logger.warning("[快捷题目-撤销] 撤销栈为空")
+            return False
+        try:
+            item = stack.pop()
+            st.session_state.quick_categories = item["snapshot"]
+            logger.info("[快捷题目-撤销] ✅ 回滚「%s」(TS=%s) | 剩余撤销栈=%d",
+                        item["desc"], item["ts"], len(stack))
+            st.info(f"↩️ 已撤销:「{item['desc']}」 ({item['ts']})")
+            return True
+        except Exception as _e:
+            logger.error("[快捷题目-撤销] 异常: %s", _e, exc_info=True)
+            st.error(f"撤销失败: {_e}")
+            return False
+
+    # ------- 顶部标题行 + 撤销按钮 -------
+    hdr_col1, hdr_col2, hdr_col3 = st.columns([3, 1, 1])
+    with hdr_col1:
+        st.subheader("⚡ 快捷问题(按分类点击)")
+    with hdr_col2:
+        edit_mode = st.toggle("✏️ 编辑模式", key="ai_quick_edit_mode", value=False)
+    with hdr_col3:
+        undo_depth = len(st.session_state.quick_categories_undo)
+        if st.button(f"↩️ 撤销 ({undo_depth})", key="ai_quick_undo",
+                     use_container_width=True, disabled=(undo_depth == 0),
+                     help="最多保留 {} 步".format(MAX_UNDO_HISTORY)):
+            if _do_undo():
+                st.rerun()
+
+    def _ask_question(q_text: str) -> None:
+        """统一的快捷问题发送逻辑(避免重复代码)。"""
+        logger.info("[快捷题目-AI] 发送问题: %s (len=%d)", q_text[:50], len(q_text))
+        st.session_state.ai_messages.append({"role": "user", "content": q_text})
+        with st.chat_message("user"):
+            st.markdown(q_text)
+        with st.chat_message("assistant"):
+            with st.spinner("AI 思考中..."):
+                try:
+                    from src.ai_assistant import ask
+                    t0 = time.perf_counter()
+                    answer = ask(q_text)
+                    logger.info("[快捷题目-AI] 返回 OK | 耗时=%dms | 答案len=%d",
+                                int((time.perf_counter() - t0) * 1000), len(answer))
+                except Exception as e:
+                    answer = f"AI 调用异常: {e}"
+                    logger.error("[快捷题目-AI] 调用异常: %s", e, exc_info=True)
+                st.markdown(answer)
+                st.session_state.ai_messages.append(
+                    {"role": "assistant", "content": answer})
+
+    pending_cat_op = None  # 收集分类级操作,避免 for 循环内修改索引问题
+
+    # ===== 遍历每个分类 =====
+    for ci, cat in enumerate(st.session_state.quick_categories):
+        cat_key = f"ai_cat_{ci}"
+        with st.container(border=True):
+            if edit_mode:
+                t_col1, t_col2, t_col3, t_col4, t_col5 = st.columns(
+                    [4, 0.9, 0.9, 0.9, 0.9], gap="small"
+                )
+                with t_col1:
+                    # ---- 分类名 on_change 处理 + 快照 + 日志 ----
+                    def _on_cat_name_changed(_ci=ci, _old=cat["name"], _key=f"{cat_key}_name"):
+                        _new = st.session_state.get(_key, "")
+                        if not _new.strip():
+                            logger.warning("[快捷题目-分类改名] ⚠️ 分类[%d]新名字为空,拒绝保存 old=%r", _ci, _old)
+                            st.session_state[_key] = _old
+                            return
+                        if _new == _old:
+                            return
+                        _snapshot_for_undo(f"分类[{_ci}]改名: {_old[:20]} → {_new[:20]}")
                         try:
-                            from src.ai_assistant import ask
-                            answer = ask(q)
-                        except Exception as e:
-                            answer = f"AI 调用异常: {e}"
-                        st.markdown(answer)
-                        st.session_state.ai_messages.append(
-                            {"role": "assistant", "content": answer})
+                            st.session_state.quick_categories[_ci]["name"] = _new.strip()
+                            logger.info("[快捷题目-分类改名] ✅ 分类[%d] | old=%r → new=%r", _ci, _old, _new)
+                        except Exception as _rn_e:
+                            logger.error("[快捷题目-分类改名] ❌ 保存失败 ci=%d err=%s", _ci, _rn_e, exc_info=True)
+                            st.error(f"分类名保存失败: {_rn_e}")
+                    st.text_input("分类名", value=cat["name"],
+                                  key=f"{cat_key}_name", label_visibility="collapsed",
+                                  on_change=_on_cat_name_changed)
+                with t_col2:
+                    if st.button("⬆️ 上移", key=f"{cat_key}_up",
+                                 disabled=(ci == 0), use_container_width=True):
+                        pending_cat_op = ("move_up", ci)
+                with t_col3:
+                    if st.button("⬇️ 下移", key=f"{cat_key}_down",
+                                 disabled=(ci == len(st.session_state.quick_categories) - 1),
+                                 use_container_width=True):
+                        pending_cat_op = ("move_down", ci)
+                with t_col4:
+                    if st.button("➕ 题目", key=f"{cat_key}_addq", use_container_width=True):
+                        pending_cat_op = ("add_q", ci)
+                with t_col5:
+                    if st.button("🗑️ 删除分类", key=f"{cat_key}_del",
+                                 type="secondary", use_container_width=True):
+                        pending_cat_op = ("delete", ci)
+            else:
+                st.markdown(f"**{cat['name']}**")
+
+            questions = cat["questions"]
+            if questions:
+                pending_q_op = None
+                for qi, q in enumerate(questions):
+                    q_key = f"{cat_key}_q_{qi}"
+                    q_row = st.columns([0.8, 5, 0.7, 0.7, 0.7, 0.7], gap="small") \
+                        if edit_mode else st.columns([1])
+
+                    if edit_mode:
+                        q_row[0].caption(f"Q{qi+1}")
+                        # ---- 题目内容 on_change + 快照 + 日志 ----
+                        def _on_q_changed(_ci=ci, _qi=qi, _old_q=q, _k=f"{q_key}_edit"):
+                            _new_q = st.session_state.get(_k, "")
+                            if _new_q == _old_q:
+                                return
+                            if not _new_q.strip():
+                                logger.warning("[快捷题目-题目编辑] ⚠️ 分类[%d]题[%d]内容为空,拒绝保存", _ci, _qi)
+                                st.session_state[_k] = _old_q
+                                return
+                            _snapshot_for_undo(f"分类[{_ci}]题[{_qi}]编辑")
+                            try:
+                                st.session_state.quick_categories[_ci]["questions"][_qi] = _new_q
+                                logger.info("[快捷题目-题目编辑] ✅ 分类[%d]题[%d] | 前len=%d 后len=%d",
+                                            _ci, _qi, len(_old_q), len(_new_q))
+                            except Exception as _qe:
+                                logger.error("[快捷题目-题目编辑] ❌ 保存失败 ci=%d qi=%d err=%s",
+                                             _ci, _qi, _qe, exc_info=True)
+                                st.error(f"题目保存失败: {_qe}")
+                        q_row[1].text_input("题目内容", value=q, key=f"{q_key}_edit",
+                                            label_visibility="collapsed", on_change=_on_q_changed)
+
+                        btn_up = q_row[2].button("⬆️", key=f"{q_key}_up",
+                                                 disabled=(qi == 0), use_container_width=True)
+                        btn_down = q_row[3].button("⬇️", key=f"{q_key}_down",
+                                                   disabled=(qi == len(questions) - 1),
+                                                   use_container_width=True)
+                        btn_ask = q_row[4].button("💬", key=f"{q_key}_ask",
+                                                  use_container_width=True, help="发送给 AI")
+                        btn_del = q_row[5].button("🗑️", key=f"{q_key}_del",
+                                                  type="secondary", use_container_width=True)
+                        if btn_ask:
+                            _ask_question(st.session_state.quick_categories[ci]["questions"][qi])
+                        if btn_up and qi > 0:
+                            pending_q_op = ("q_up", ci, qi)
+                        if btn_down and qi < len(questions) - 1:
+                            pending_q_op = ("q_down", ci, qi)
+                        if btn_del:
+                            pending_q_op = ("q_delete", ci, qi)
+                    else:
+                        with q_row[0]:
+                            if st.button(q, key=f"{q_key}_btn", use_container_width=True):
+                                _ask_question(q)
+
+                # ---- 统一执行题目级操作 ----
+                if pending_q_op:
+                    op, _ci, _qi = pending_q_op
+                    lst = st.session_state.quick_categories[_ci]["questions"]
+                    if op == "q_up":
+                        _snapshot_for_undo(f"分类[{_ci}]题[{_qi}]上移")
+                        try:
+                            lst[_qi - 1], lst[_qi] = lst[_qi], lst[_qi - 1]
+                            logger.info("[快捷题目-题目移动] ✅ 分类[%d]题%d↔题%d 上移", _ci, _qi, _qi - 1)
+                            st.rerun()
+                        except Exception as _e:
+                            logger.error("[快捷题目-题目移动] ❌ 上移失败 ci=%d qi=%d err=%s", _ci, _qi, _e, exc_info=True)
+                            st.error(f"题上移失败: {_e}")
+                    elif op == "q_down":
+                        _snapshot_for_undo(f"分类[{_ci}]题[{_qi}]下移")
+                        try:
+                            lst[_qi], lst[_qi + 1] = lst[_qi + 1], lst[_qi]
+                            logger.info("[快捷题目-题目移动] ✅ 分类[%d]题%d↔题%d 下移", _ci, _qi, _qi + 1)
+                            st.rerun()
+                        except Exception as _e:
+                            logger.error("[快捷题目-题目移动] ❌ 下移失败 ci=%d qi=%d err=%s", _ci, _qi, _e, exc_info=True)
+                            st.error(f"题下移失败: {_e}")
+                    elif op == "q_delete":
+                        _snapshot_for_undo(f"分类[{_ci}]删除题[{_qi}]")
+                        try:
+                            removed = lst.pop(_qi)
+                            logger.info("[快捷题目-题目删除] ✅ 分类[%d]删除题%d | %r", _ci, _qi, removed[:50])
+                            st.rerun()
+                        except Exception as _e:
+                            logger.error("[快捷题目-题目删除] ❌ 删除失败 ci=%d qi=%d err=%s", _ci, _qi, _e, exc_info=True)
+                            st.error(f"题删除失败: {_e}")
+            elif edit_mode:
+                st.caption("(暂无题目,点右侧「➕ 题目」添加)")
+
+    # ---- 统一执行分类级操作 ----
+    if pending_cat_op:
+        op_c, idx_c = pending_cat_op
+        cats_ref = st.session_state.quick_categories
+        if op_c == "move_up":
+            _snapshot_for_undo(f"分类[{idx_c}]上移")
+            try:
+                cats_ref[idx_c - 1], cats_ref[idx_c] = cats_ref[idx_c], cats_ref[idx_c - 1]
+                logger.info("[快捷题目-分类移动] ✅ 分类%d↔分类%d 上移 | %s",
+                            idx_c, idx_c - 1, [c["name"] for c in cats_ref])
+                st.rerun()
+            except Exception as _e:
+                logger.error("[快捷题目-分类移动] ❌ 上移失败 ci=%d err=%s", idx_c, _e, exc_info=True)
+                st.error(f"分类上移失败: {_e}")
+        elif op_c == "move_down":
+            _snapshot_for_undo(f"分类[{idx_c}]下移")
+            try:
+                cats_ref[idx_c], cats_ref[idx_c + 1] = cats_ref[idx_c + 1], cats_ref[idx_c]
+                logger.info("[快捷题目-分类移动] ✅ 分类%d↔分类%d 下移 | %s",
+                            idx_c, idx_c + 1, [c["name"] for c in cats_ref])
+                st.rerun()
+            except Exception as _e:
+                logger.error("[快捷题目-分类移动] ❌ 下移失败 ci=%d err=%s", idx_c, _e, exc_info=True)
+                st.error(f"分类下移失败: {_e}")
+        elif op_c == "delete":
+            _snapshot_for_undo(f"删除分类[{idx_c}] {cats_ref[idx_c]['name'][:30]}")
+            try:
+                removed_cat = cats_ref.pop(idx_c)
+                logger.info("[快捷题目-分类删除] ✅ 删除分类 idx=%d name=%r 题数=%d | 剩余=%s",
+                            idx_c, removed_cat["name"], len(removed_cat["questions"]),
+                            [c["name"] for c in cats_ref])
+                st.rerun()
+            except Exception as _e:
+                logger.error("[快捷题目-分类删除] ❌ 删除失败 ci=%d err=%s", idx_c, _e, exc_info=True)
+                st.error(f"删除分类失败: {_e}")
+        elif op_c == "add_q":
+            _snapshot_for_undo(f"分类[{idx_c}]新增题目")
+            try:
+                cats_ref[idx_c]["questions"].append("新题目(点 ✏️ 编辑)")
+                logger.info("[快捷题目-新增题] ✅ 分类[%d](%s)新增1题 | 总数=%d",
+                            idx_c, cats_ref[idx_c]["name"], len(cats_ref[idx_c]["questions"]))
+                st.rerun()
+            except Exception as _e:
+                logger.error("[快捷题目-新增题] ❌ 分类[%d]失败 err=%s", idx_c, _e, exc_info=True)
+                st.error(f"新增题目失败: {_e}")
+
+    # ===== 编辑模式: 底部新增分类 + 重置 =====
+    if edit_mode:
+        st.divider()
+        mgmt_cols = st.columns([2, 1, 1])
+        with mgmt_cols[0]:
+            new_cat_name = st.text_input(
+                "新增分类名(带 emoji 更清晰,例如 🆘 常见报错)",
+                key="ai_new_cat_name", placeholder="例如: 🆘 常见报错排查"
+            )
+        with mgmt_cols[1]:
+            if st.button("➕ 新增分类", key="ai_add_cat_btn", use_container_width=True,
+                         disabled=(not new_cat_name.strip())):
+                nc_name = new_cat_name.strip()
+                _snapshot_for_undo(f"新增分类 {nc_name}")
+                try:
+                    st.session_state.quick_categories.append({
+                        "name": nc_name,
+                        "questions": ["示例题目(可编辑)"]
+                    })
+                    logger.info("[快捷题目-新增分类] ✅ 新增 %r | 当前分类数=%d",
+                                nc_name, len(st.session_state.quick_categories))
+                    st.rerun()
+                except Exception as _e:
+                    logger.error("[快捷题目-新增分类] ❌ 失败 name=%r err=%s", nc_name, _e, exc_info=True)
+                    st.error(f"新增分类失败: {_e}")
+        with mgmt_cols[2]:
+            if st.button("♻️ 恢复默认题目", key="ai_reset_cat_btn", use_container_width=True,
+                         type="secondary"):
+                _snapshot_for_undo("恢复默认题目(重置)")
+                try:
+                    st.session_state.quick_categories = _deepcopy_categories(DEFAULT_QUICK_CATEGORIES)
+                    st.session_state.quick_categories_undo = []
+                    logger.info("[快捷题目-重置] ✅ 已恢复默认 %d 分类,撤销栈已清空",
+                                len(DEFAULT_QUICK_CATEGORIES))
+                    st.rerun()
+                except Exception as _e:
+                    logger.error("[快捷题目-重置] ❌ 失败 err=%s", _e, exc_info=True)
+                    st.error(f"恢复默认题目失败: {_e}")
+        st.caption(
+            "💡 编辑模式说明:①分类名/题目输入框直接编辑(失焦或回车即保存,自动打撤销点) "
+            "②⬆️⬇️ 调整分类/题目顺序 ③🗑️ 删除 ④「➕ 题目/新增分类」添加 "
+            "⑤误操作时点右上角「↩️ 撤销 (N)」按钮回滚(最多保留 {} 步) "
+            "⑥「♻️ 恢复默认题目」一键回到出厂状态".format(MAX_UNDO_HISTORY)
+        )
 
 
 @tab_safe_render

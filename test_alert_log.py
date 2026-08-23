@@ -34,8 +34,8 @@ from components.durability_alert_log import (
 # ============================================================
 from durability.database import (
     init_db as _db_init,
-    render_streamlit_db_status,
     print_console_db_status,
+    get_db_backend_info,
 )
 _db_init()
 print_console_db_status("test_alert_log 启动 · DB 初始化状态")
@@ -163,9 +163,18 @@ def main() -> None:
     st.title("📋 预警历史记录面板 - 效果预览")
     st.caption("测试 components/durability_alert_log.py 渲染效果（20条模拟事件）")
 
-    # ✅ 侧边栏底部: DB 状态卡片 + 降级醒目警告
+    # ✅ 侧边栏底部: DB 状态(无敏感配置) + 降级醒目警告
     with st.sidebar:
-        render_streamlit_db_status(st.sidebar)
+        info = get_db_backend_info()
+        backend = info["backend"]
+        if "MySQL" in backend:
+            st.success("✅ 已连接 MySQL (腾讯云)")
+        else:
+            note = info.get("note", "")
+            if note:
+                st.error(f"⚠️ MySQL 不可用, 已降级到 SQLite")
+            else:
+                st.warning("⚠️ 使用本地 SQLite (重启会丢失数据)")
 
     # 构造模拟数据
     events = make_mock_events(20)
