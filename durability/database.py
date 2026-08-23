@@ -2072,14 +2072,97 @@ def print_console_db_status(header: str = "DB 运行时状态") -> None:
     print(f"{bar}")
 
 
+def test_mysql_connection() -> dict:
+    """测试 MySQL 连接并返回诊断结果。
+    
+    Returns:
+        dict: {
+            'success': bool,
+            'latency_ms': float,  # 仅成功时有
+            'error': str,         # 仅失败时有
+            'suggestion': str,    # 仅失败时有
+        }
+    """
+    import time as _time
+    result = {"success": False}
+    
+    cfg = {k: os.getenv(k, "").strip() for k in 
+           ["DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME"]}
+    
+    # 检查配置是否完整
+    missing = [k for k, v in cfg.items() if not v]
+    if missing:
+        result["error"] = f"缺少配置项: {', '.join(missing)}"
+        result["suggestion"] = "请在 Streamlit Cloud Secrets 中添加完整的 DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME"
+        return result
+    
+    # 测试连接
+    t0 = _time.perf_counter()
+    try:
+        import pymysql
+        conn = pymysql.connect(
+            host=cfg["DB_HOST"],
+            port=int(cfg["DB_PORT"]),
+            user=cfg["DB_USER"],
+            password=cfg["DB_PASSWORD"],
+            database=cfg["DB_NAME"],
+            connect_timeout=10,
+            read_timeout=5,
+            write_timeout=5,
+            charset="utf8mb4",
+        )
+        latency = (_time.perf_counter() - t0) * 1000
+        
+        # 执行一个简单查询验证
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        
+        conn.close()
+        result["success"] = True
+        result["latency_ms"] = latency
+        logger.info("[MySQL测试] 连接成功, 耗时: %.1fms", latency)
+        
+    except pymysql.err.OperationalError as e:
+        latency = (_time.perf_counter() - t0) * 1000
+        err_code = e.args[0] if e.args else "unknown"
+        err_msg = str(e)
+        
+        if err_code == 1045:  # Access denied
+            result["error"] = f"访问被拒绝 (code=1045): 用户名或密码错误"
+            result["suggestion"] = "请检查 DB_USER 和 DB_PASSWORD 是否正确"
+        elif err_code == 2003:  # Can't connect
+            result["error"] = f"无法连接到 MySQL 服务器 (code=2003): 主机地址或端口错误"
+            result["suggestion"] = "请检查 DB_HOST 和 DB_PORT 是否正确，以及网络是否可达"
+        elif err_code == 2006:  # MySQL server has gone away
+            result["error"] = f"MySQL 服务器已断开 (code=2006)"
+            result["suggestion"] = "可能是网络不稳定或服务器过载，请稍后重试"
+        elif err_code == 1049:  # Unknown database
+            result["error"] = f"数据库不存在 (code=1049): {cfg['DB_NAME']}"
+            result["suggestion"] = "请在腾讯云控制台创建数据库，或修改 DB_NAME"
+        else:
+            result["error"] = f"MySQL 错误 (code={err_code}): {err_msg}"
+            result["suggestion"] = "请检查配置是否正确"
+        
+        logger.error("[MySQL测试] 连接失败: %s", result["error"])
+        
+    except Exception as e:
+        result["error"] = f"未知错误: {str(e)}"
+        result["suggestion"] = "请检查网络连接或联系管理员"
+        logger.error("[MySQL测试] 未知错误: %s", str(e))
+    
+    return result
+
+
 def render_streamlit_db_status(
     container,  # st.sidebar 或任意 st.container
     position: str = "sidebar",
 ) -> None:
-    """给 Streamlit 页面用的 DB 状态卡片 + 降级警告。
+    """给 Streamlit 页面用的 DB 状态卡片 + 降级警告 + 连接测试。
 
-    - 正常 MySQL: 显示一个 info/ success 提示 (host/db/user)
+    - 正常 MySQL: 显示一个 success 提示 (host/db/user)
     - 降级 SQLite: 醒目 error 横幅提示用户注意
+    - 提供「测试 MySQL 连接」按钮用于诊断
     """
     info = get_db_backend_info()
     backend = info["backend"]
@@ -2088,12 +2171,13 @@ def render_streamlit_db_status(
             import streamlit as _st
             _st.divider()
             _st.subheader("🗄️ 数据库状态")
+        
         if "MySQL" in backend:
             container.success(
-                f"**后端: MySQL (腾讯云)**\n\n"
+                f"**✅ 后端: MySQL (腾讯云)**\n\n"
                 f"Host: `{info.get('host','')}:{info.get('port','')}`  \n"
                 f"DB: `{info.get('database','')}`  User: `{info.get('user','')}`\n\n"
-                f"若外网中断, 系统会自动降级到本地 SQLite, 日志中将出现 `[DB 降级]` 横幅。"
+                f"数据已持久化存储, 重启不丢失。"
             )
         else:
             note = info.get("note", "")
@@ -2105,11 +2189,40 @@ def render_streamlit_db_status(
                     f"文件: `{info.get('path','')}`"
                 )
             else:
-                container.info(
-                    f"**后端: SQLite (本地)**\n\n"
-                    f".env 未配置 MySQL 或启动阶段已降级。  \n"
+                container.warning(
+                    f"**⚠️  当前: SQLite (本地)**\n\n"
+                    f"未检测到 MySQL 配置, 数据存储在本地 SQLite。  \n"
+                    f"⚠️ 注意: Streamlit Cloud 上 SQLite 数据会在重启后丢失!  \n"
                     f"文件: `{info.get('path','')}`"
                 )
+        
+        # 显示配置来源信息
+        import streamlit as _st
+        with _st.expander("🔧 数据库配置详情", expanded=False):
+            _st.caption("配置优先级: Streamlit Cloud Secrets > .env 文件")
+            
+            # 显示当前环境变量中的 DB 配置
+            db_keys = ["DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME"]
+            _st.markdown("**当前环境变量配置:**")
+            for k in db_keys:
+                v = os.environ.get(k, "")
+                if k == "DB_PASSWORD":
+                    display = f"{v[:3]}***{v[-3:]}" if len(v) > 6 else "***"
+                else:
+                    display = v if v else "(未设置)"
+                status = "✅" if v else "❌"
+                _st.text(f"  {status} {k} = {display}")
+            
+            # 测试连接按钮
+            if _st.button("🔍 测试 MySQL 连接", type="secondary", use_container_width=True):
+                _st.info("正在测试 MySQL 连接...")
+                result = test_mysql_connection()
+                if result["success"]:
+                    _st.success(f"✅ MySQL 连接成功! 耗时: {result['latency_ms']:.0f}ms")
+                else:
+                    _st.error(f"❌ MySQL 连接失败: {result['error']}")
+                    if result.get("suggestion"):
+                        _st.warning(f"💡 建议: {result['suggestion']}")
 
 
 
