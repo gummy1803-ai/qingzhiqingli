@@ -171,7 +171,7 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
         st.caption(f"🔗 DB快照暂不可用（首次导入时自动同步）: {str(_snap_err)[:40]}")
 
     # ------ 文件夹管理面板 ------
-    with st.expander("📂 文件夹管理（新建/删除/重命名）", expanded=False):
+    with st.expander("📂 文件夹管理（新建/删除/重命名）", expanded=True):
         folders = bm.list_folders(active_branch)
         folder_paths = [""] + [f["path"] for f in folders]
         if folders:
@@ -300,17 +300,184 @@ def _render_file_structure_tab(bm: BranchManager, active_branch: str):
             files = [f for f in files
                      if str(Path(f["path"]).parent).replace("\\", "/") == parent_need]
 
-        # 文件表格
-        df = pd.DataFrame([{
-            "📁 路径": f["path"],
-            "📄 文件名": f["name"],
-            "💾 大小": _format_size(f["size"]),
-            "✅ 状态": "✅ 有效" if f["is_valid"] else "❌ 损坏",
-            "🔐 哈希": f["hash"][:16] + "...",
-            "📅 修改时间": f["modified"][:19]
-        } for f in files])
+        # ===== 文件列表 (每行独立操作按钮: 预览 / 重命名 / 移动 / 删除) =====
+        # 用户反馈"看不到对旧文件的操作按钮"，所以不用只读 dataframe；直接每行放 4 个按钮
+        folder_paths2 = ["（根目录）"] + [f["path"] for f in folders]
+        st.markdown(f"**🗂️ 文件清单（共 {len(files)} 个）** · 每行右侧 4 个按钮直接操作")
 
-        st.dataframe(df, use_container_width=True, hide_index=True, height=240)
+        for i, f in enumerate(files):
+            path = f["path"]
+            hk = f["hash"][:12]  # 行级唯一 key 前缀
+            name_only = f["name"]
+            parent_only = str(Path(path).parent).replace("\\", "/")
+            if parent_only == ".":
+                parent_only = ""
+            size_s = _format_size(f["size"])
+            st_s = "✅" if f["is_valid"] else "❌"
+
+            with st.container(border=True):
+                # 主行: 信息 + 4 按钮
+                c_path, c_size, c_stat, c_p, c_r, c_m, c_d = st.columns(
+                    [3.2, 1, 0.7, 0.85, 0.85, 0.85, 0.85], gap="small"
+                )
+                with c_path:
+                    st.markdown(
+                        f"<div style='font-size:0.8rem; word-break:break-all;'>"
+                        f"📄 **<span title='{path}'>{name_only}</span>**</div>"
+                        f"<div style='font-size:0.68rem;color:#6B7894;'>"
+                        f"📁 {parent_only or '(根)'} · 🔐 {f['hash'][:8]} · "
+                        f"📅 {f['modified'][:16].replace('T',' ')}</div>",
+                        unsafe_allow_html=True,
+                    )
+                c_size.caption(f"💾 {size_s}")
+                c_stat.caption(f"{st_s} {'有效' if f['is_valid'] else '损坏'}")
+
+                # 4 个 action 按钮 (点了即展开下面的表单)
+                btn_preview = c_p.button("👁️ 预览", key=f"fpv_{hk}", use_container_width=True)
+                btn_rename = c_r.button("✏️ 改名", key=f"frn_{hk}", use_container_width=True)
+                btn_move = c_m.button("➡️ 移动", key=f"fmv_{hk}", use_container_width=True)
+                btn_delete = c_d.button("�️ 删除", key=f"fdl_{hk}", use_container_width=True)
+
+                # 基于 session_state 决定哪一行的哪个面板展开 (Streamlit btn 触发 rerun, 所以点过即置位)
+                open_key = f"row_open_{hk}"
+                if btn_preview:
+                    st.session_state[open_key] = "preview"
+                if btn_rename:
+                    st.session_state[open_key] = "rename"
+                if btn_move:
+                    st.session_state[open_key] = "move"
+                if btn_delete:
+                    st.session_state[open_key] = "delete"
+
+                open_mode = st.session_state.get(open_key, "")
+                if open_mode:
+                    st.markdown("---")
+                    col_a, col_b = st.columns([14, 1])
+                    with col_b:
+                        if st.button("✕ 收起", key=f"cls_{hk}"):
+                            st.session_state[open_key] = ""
+                            st.rerun()
+                    with col_a:
+                        # === 预览面板 ===
+                        if open_mode == "preview":
+                            _logger.info("[UI-行预览] branch=%s, path=%s", active_branch, path)
+                            with st.spinner("读取文件..."):
+                                prev = bm.open_file_preview(active_branch, path, max_rows=150)
+                            if not prev.get("ok"):
+                                st.error(prev.get("error") or "预览失败")
+                            else:
+                                kind = prev.get("kind", "")
+                                st.info(f"� 类型: **{kind.upper()}** · 大小: {_format_size(prev.get('size',0))} · "
+                                        f"行数: {prev.get('rows',0)} · 列数: {prev.get('cols',0)}")
+                                if prev.get("kind") in ("csv", "excel"):
+                                    st.dataframe(prev.get("dataframe"), use_container_width=True, height=320)
+                                elif prev.get("kind") == "docx":
+                                    if prev.get("dataframe") is not None:
+                                        st.dataframe(prev["dataframe"], use_container_width=True, height=300)
+                                    if prev.get("text"):
+                                        with st.expander("正文(前200段)", expanded=False):
+                                            st.text(prev["text"])
+                                elif prev.get("kind") == "image":
+                                    try:
+                                        st.image(prev.get("raw_path"), caption=name_only)
+                                    except Exception:
+                                        st.info("图片需本地打开")
+                                elif prev.get("kind") == "text":
+                                    st.text_area("文本", value=prev.get("text",""), height=300)
+                                else:
+                                    try:
+                                        with open(prev.get("raw_path"),"rb") as fh:
+                                            st.download_button("⬇️ 下载", data=fh.read(),
+                                                               file_name=name_only, key=f"dl_{hk}")
+                                    except Exception as dl_e:
+                                        st.error(str(dl_e))
+
+                        # === 重命名面板 ===
+                        elif open_mode == "rename":
+                            rn_default = name_only
+                            new_name = st.text_input(
+                                "新文件名（保持同目录，要带扩展名）",
+                                value=rn_default, key=f"rnt_{hk}"
+                            )
+                            rn_target = (Path(parent_only) / new_name).as_posix() if parent_only else new_name
+                            st.caption(f"目标路径: `.branches/{active_branch}/{rn_target}`")
+                            col_rn_ok, col_rn_cancel = st.columns([1, 1])
+                            with col_rn_cancel:
+                                if st.button("取消", key=f"rn_cancel_{hk}", use_container_width=True):
+                                    st.session_state[open_key] = ""; st.rerun()
+                            with col_rn_ok:
+                                if st.button("✅ 确认改名", type="primary", key=f"rn_ok_{hk}",
+                                             use_container_width=True, disabled=(not new_name)):
+                                    if Path(new_name).name != new_name.strip():
+                                        st.error("❌ 不能包含路径斜杠；要换目录请点「➡️ 移动」")
+                                    elif not new_name.strip():
+                                        st.error("❌ 名字不能空")
+                                    else:
+                                        _logger.info("[UI-行重命名] branch=%s, old=%s, new=%s",
+                                                     active_branch, path, rn_target)
+                                        ok, msg = bm.rename_file(active_branch, path, rn_target)
+                                        if ok:
+                                            st.success(msg); st.session_state[open_key] = ""; st.rerun()
+                                        else:
+                                            st.error(msg)
+
+                        # === 移动面板 ===
+                        elif open_mode == "move":
+                            mv_folder_label = st.selectbox(
+                                "移动到哪个文件夹？", options=folder_paths2,
+                                key=f"mv_folder_{hk}"
+                            )
+                            mv_folder = "" if mv_folder_label == "（根目录）" else mv_folder_label
+                            mv_name = st.text_input(
+                                "文件名（不改就留原）", value=name_only, key=f"mv_name_{hk}"
+                            )
+                            if Path(mv_name).name != mv_name.strip():
+                                st.warning("⚠️ 这里只能改文件名，目录在上面下拉选")
+                            mv_target = (Path(mv_folder) / Path(mv_name).name).as_posix() \
+                                if mv_folder else Path(mv_name).name
+                            st.caption(f"最终位置: `.branches/{active_branch}/{mv_target}`")
+                            col_mv_ok, col_mv_cancel = st.columns([1, 1])
+                            with col_mv_cancel:
+                                if st.button("取消", key=f"mv_cancel_{hk}", use_container_width=True):
+                                    st.session_state[open_key] = ""; st.rerun()
+                            with col_mv_ok:
+                                disabled = (Path(mv_name).name != mv_name.strip())
+                                if st.button("➡️ 执行移动", type="primary", key=f"mv_ok_{hk}",
+                                             use_container_width=True, disabled=disabled):
+                                    if path == mv_target:
+                                        st.info("源和目标一样，跳过")
+                                    else:
+                                        _logger.info("[UI-行移动] branch=%s, src=%s, dst=%s",
+                                                     active_branch, path, mv_target)
+                                        ok, msg = bm.move_file(active_branch, path, mv_target)
+                                        if ok:
+                                            st.success(msg); st.session_state[open_key] = ""; st.rerun()
+                                        else:
+                                            st.error(msg)
+
+                        # === 删除面板 ===
+                        elif open_mode == "delete":
+                            st.warning(f"⚠️ 将从分支 `{active_branch}` 物理删除 "
+                                       f"`{path}`（{size_s}），此操作不可恢复；"
+                                       f"关联的 DB 分支快照会同步清理。")
+                            confirm1 = st.checkbox("我理解这是文件物理删除，不是软删除", key=f"dl_c1_{hk}")
+                            confirm2 = st.checkbox(f"确认删除 `{name_only}`", key=f"dl_c2_{hk}")
+                            col_dl_ok, col_dl_cancel = st.columns([1, 1])
+                            with col_dl_cancel:
+                                if st.button("取消", key=f"dl_cancel_{hk}", use_container_width=True):
+                                    st.session_state[open_key] = ""; st.rerun()
+                            with col_dl_ok:
+                                if st.button("🗑️ 确认删除", type="primary", key=f"dl_ok_{hk}",
+                                             use_container_width=True,
+                                             disabled=(not confirm1 or not confirm2)):
+                                    _logger.info("[UI-行删除] branch=%s, file=%s", active_branch, path)
+                                    ok, msg = bm.remove_file(active_branch, path)
+                                    if ok:
+                                        st.success(msg); st.session_state[open_key] = ""; st.rerun()
+                                    else:
+                                        st.error(msg)
+
+        st.caption("💡 上面每行 4 个按钮不够用？下方高级面板按 Tab 分类：预览 / 移动 / 重命名 / 删除（批量选择文件）")
 
         # ===== 动作面板: 预览 / 移动 / 重命名 / 删除 =====
         st.markdown("### 🛠️ 文件操作（单文件）")
@@ -855,6 +1022,10 @@ def render_sidebar_file_structure():
         if len(files) > len(truncated):
             st.caption(f"仅显示前 {len(truncated)} 个，完整列表请到「🌿 分支管理」Tab")
 
+        # 侧边栏『移动文件』也需要文件夹列表：提前一次性拉取
+        _sb_folders = bm.list_folders(active)
+        _sb_folder_opts = ["（根目录）"] + [_f["path"] for _f in _sb_folders]
+
         for f in truncated:
             path = f["path"]
             size_s = _format_size(f["size"])
@@ -871,7 +1042,7 @@ def render_sidebar_file_structure():
                     )
                 with r2:
                     op = st.selectbox(
-                        "操作", ["", "👁️预览", "✏️重命名", "🗑️删除"],
+                        "操作", ["", "👁️预览", "✏️重命名", "➡️移动", "🗑️删除"],
                         key=f"sb_op_{f['hash'][:12]}",
                         label_visibility="collapsed",
                     )
@@ -916,6 +1087,36 @@ def render_sidebar_file_structure():
                             _logger.info("[侧边栏-重命名] branch=%s, old=%s, new=%s",
                                          active, path, combined)
                             ok, msg = bm.rename_file(active, path, combined)
+                            if ok:
+                                st.success(msg); st.rerun()
+                            else:
+                                st.error(msg)
+                elif op == "➡️移动":
+                    # 侧边栏简化版移动：选目标文件夹 + 可选改名 (不改留原文件名)
+                    mv_lab = st.selectbox(
+                        "移到哪个文件夹？", options=_sb_folder_opts,
+                        key=f"sb_mvfolder_{f['hash'][:12]}",
+                    )
+                    mv_dst_dir = "" if mv_lab == "（根目录）" else mv_lab
+                    mv_name = st.text_input(
+                        "文件名（不改就留原）",
+                        value=Path(path).name,
+                        key=f"sb_mvname_{f['hash'][:12]}",
+                    )
+                    if Path(mv_name).name != mv_name.strip():
+                        st.warning("⚠️ 这里只改文件名，目录在上面下拉选")
+                    combined_mv = (Path(mv_dst_dir) / Path(mv_name).name).as_posix() \
+                        if mv_dst_dir else Path(mv_name).name
+                    st.caption(f"→ `.branches/{active}/{combined_mv}`")
+                    disabled = (Path(mv_name).name != mv_name.strip())
+                    if st.button("➡️ 执行移动", key=f"sb_mvbtn_{f['hash'][:12]}",
+                                 type="primary", use_container_width=True, disabled=disabled):
+                        if path == combined_mv:
+                            st.info("源=目标，跳过")
+                        else:
+                            _logger.info("[侧边栏-移动] branch=%s, src=%s, dst=%s",
+                                         active, path, combined_mv)
+                            ok, msg = bm.move_file(active, path, combined_mv)
                             if ok:
                                 st.success(msg); st.rerun()
                             else:
