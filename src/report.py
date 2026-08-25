@@ -21,6 +21,48 @@ from src.plots import (
 logger = get_logger(__name__)
 
 
+# =====================================================================
+# 辅助函数 (放在所有业务函数之前, 避免同模块内部出现自引用 import)
+# =====================================================================
+
+def _fig_to_html(fig: go.Figure, full_html: bool = False) -> str:
+    """Plotly 图 → 内嵌 HTML (关闭工具栏减少 DOM 体积)。"""
+    return fig.to_html(
+        include_plotlyjs="cdn",
+        full_html=full_html,
+        div_id=None,
+        config={"displayModeBar": False, "responsive": True},
+    )
+
+
+def _downsample(df: pd.DataFrame, max_points: int = 1000) -> pd.DataFrame:
+    """大数据量降采样到 max_points 条(等间隔抽样)。"""
+    if len(df) <= max_points:
+        return df
+    step = max(1, len(df) // max_points)
+    out = df.iloc[::step].reset_index(drop=True)
+    logger.info("降采样: %d → %d (step=%d)", len(df), len(out), step)
+    return out
+
+
+def _flat_dict(d: dict, prefix: str = "") -> dict:
+    """扁平化嵌套字典,键含路径,便于行表展示。"""
+    out: dict[str, str] = {}
+    if not isinstance(d, dict):
+        return out
+    for k, v in d.items():
+        key = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            out.update(_flat_dict(v, key))
+        else:
+            out[key] = str(v)
+    return out
+
+
+# =====================================================================
+# 业务入口:一键整车报告
+# =====================================================================
+
 def generate_vehicle_report(
     vehicle: str,
     df: pd.DataFrame,
@@ -81,7 +123,7 @@ def generate_vehicle_report(
 
 
 def _fig_to_png_bytes(fig: go.Figure, width: int = 1000, height: int = 500) -> bytes:
-    """Plotly 图 → PNG bytes。优先用 kaleido;失败时返回简单的柱状图图像。"""
+    """Plotly 图 → PNG bytes。优先用 kaleido;失败时返回空 bytes (上层会显示占位文字)。"""
     try:
         return fig.to_image(
             format="png",
@@ -90,8 +132,7 @@ def _fig_to_png_bytes(fig: go.Figure, width: int = 1000, height: int = 500) -> b
             engine="kaleido",
         )
     except Exception as e:
-        logger.warning("[报告] kaleido 导出 PNG 失败(%s),改用 SVG→base64 占位", e)
-        # 回退:把 SVG 存成 base64 占位(Word 里不显示但不崩溃)
+        logger.warning("[报告] kaleido 导出 PNG 失败(%s),跳过嵌入静态图", e)
         return b""
 
 
@@ -119,9 +160,9 @@ def _html_to_minimal_docx(
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     meta_p = doc.add_paragraph()
-    meta_p.add_run(f"车辆编号: ").bold = True
+    meta_p.add_run("车辆编号: ").bold = True
     meta_p.add_run(f"{vehicle}    ")
-    meta_p.add_run(f"生成时间: ").bold = True
+    meta_p.add_run("生成时间: ").bold = True
     meta_p.add_run(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     # ---- 一、KPI 概览 (2x4 表格) ----
@@ -151,13 +192,12 @@ def _html_to_minimal_docx(
         run_val.font.size = Pt(14)
         run_val.font.color.rgb = RGBColor(0x1F, 0x77, 0xB4)
 
-    # ---- 二、详细指标 ----
+    # ---- 二、详细指标 (直接调用同模块辅助函数,不再自引用 import) ----
     doc.add_heading("二、详细指标", level=1)
-    detail = {}
-    from src.report import _flat_dict as _fd  # 复用 module scope 的函数
-    detail.update(_fd({"单片一致性": cell_consist}))
-    detail.update(_fd({"功率与效率": power}))
-    detail.update(_fd({"氢系统": h2}))
+    detail: dict[str, str] = {}
+    detail.update(_flat_dict({"单片一致性": cell_consist}))
+    detail.update(_flat_dict({"功率与效率": power}))
+    detail.update(_flat_dict({"氢系统": h2}))
     detail_table = doc.add_table(rows=len(detail) + 1, cols=2)
     detail_table.style = "Light Grid Accent 1"
     hdr_cells = detail_table.rows[0].cells
@@ -168,23 +208,15 @@ def _html_to_minimal_docx(
         row[0].text = k
         row[1].text = v
 
-    # ---- 三、图表 (优先 kaleido PNG,无则跳过,附文字说明) ----
+    # ---- 三、图表 (直接调用模块级名字, 不做二次 import) ----
     doc.add_heading("三、图表", level=1)
-
-    from src.report import _downsample as _ds
-    from src.plots import (
-        fig_cell_voltage as _fcell,
-        fig_fault_bar as _ffault,
-        fig_power_curve as _fpow,
-        fig_speed_hydrogen as _fspeed,
-    )
-    df_s = _ds(df, max_points=500)
+    df_s = _downsample(df, max_points=500)
 
     chart_specs = [
-        ("3.1 单片电压一致性",        lambda: _fcell(df_s)),
-        ("3.2 功率与电流",            lambda: _fpow(df_s)),
-        ("3.3 车速与瞬时氢耗",        lambda: _fspeed(df_s)),
-        ("3.4 故障码分布",            lambda: _ffault(overview.get("故障码Top10", {}))),
+        ("3.1 单片电压一致性",        lambda: fig_cell_voltage(df_s)),
+        ("3.2 功率与电流",            lambda: fig_power_curve(df_s)),
+        ("3.3 车速与瞬时氢耗",        lambda: fig_speed_hydrogen(df_s)),
+        ("3.4 故障码分布",            lambda: fig_fault_bar(overview.get("故障码Top10", {}))),
     ]
     inserted_any = False
     for ctitle, fig_fn in chart_specs:
@@ -206,7 +238,7 @@ def _html_to_minimal_docx(
                 logger.warning("[报告-DOCX] %s 插入图片失败: %s", ctitle, e)
                 doc.add_paragraph(f"(图表渲染失败: {str(e)[:50]})")
         else:
-            doc.add_paragraph("(静态图不可用: 本地缺 kaleido,或 HTML 版 Ctrl+P 打印为高清 PDF)")
+            doc.add_paragraph("(静态图不可用: 缺 kaleido,建议配合 HTML 版 Ctrl+P 打印为高清 PDF)")
 
     if not inserted_any:
         p_note = doc.add_paragraph()
@@ -241,6 +273,7 @@ def _html_to_minimal_docx(
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
+
 
 HTML_TEMPLATE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -297,40 +330,6 @@ th {{ background: #f5f5f5; }}
 """
 
 
-def _fig_to_html(fig: go.Figure, full_html: bool = False) -> str:
-    # config 关闭工具栏减少 DOM 体积
-    return fig.to_html(
-        include_plotlyjs="cdn",
-        full_html=full_html,
-        div_id=None,
-        config={"displayModeBar": False, "responsive": True},
-    )
-
-
-def _downsample(df: pd.DataFrame, max_points: int = 1000) -> pd.DataFrame:
-    """大数据量降采样到 max_points 条(等间隔抽样)。"""
-    if len(df) <= max_points:
-        return df
-    step = max(1, len(df) // max_points)
-    out = df.iloc[::step].reset_index(drop=True)
-    logger.info("降采样: %d → %d (step=%d)", len(df), len(out), step)
-    return out
-
-
-def _flat_dict(d: dict, prefix: str = "") -> dict:
-    """扁平化嵌套字典,键含路径,便于行表展示。"""
-    out: dict[str, str] = {}
-    if not isinstance(d, dict):
-        return out
-    for k, v in d.items():
-        key = f"{prefix}.{k}" if prefix else str(k)
-        if isinstance(v, dict):
-            out.update(_flat_dict(v, key))
-        else:
-            out[key] = str(v)
-    return out
-
-
 def build_report_html(
     vehicle: str,
     df: pd.DataFrame,
@@ -340,7 +339,6 @@ def build_report_html(
     h2: dict,
 ) -> str:
     """组装完整 HTML 报告。"""
-    from datetime import datetime
     logger.info("开始组装 HTML 报告: 车辆=%s 行数=%d", vehicle, len(df))
 
     # KPI 卡片
@@ -363,7 +361,7 @@ def build_report_html(
         )
 
     # 详细表
-    detail = {}
+    detail: dict[str, str] = {}
     detail.update(_flat_dict({"单片一致性": cell_consist}))
     detail.update(_flat_dict({"功率与效率": power}))
     detail.update(_flat_dict({"氢系统": h2}))
