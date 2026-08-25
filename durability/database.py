@@ -2502,28 +2502,42 @@ def get_db_backend_info() -> Dict[str, str]:
     return info
 
 
+def _safe_print(*args, **kwargs):
+    """Windows GBK 控制台安全 print。"""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        safe_args = [a.encode("ascii", errors="replace").decode("ascii")
+                     if isinstance(a, str) else a for a in args]
+        try:
+            print(*safe_args, **kwargs)
+        except Exception:
+            pass
+
+
 def print_console_db_status(header: str = "DB 运行时状态") -> None:
     """给控制台脚本用的 DB 横幅打印。
 
     调用时机: main() 开头 (db_init() 之后) 或 main() 结束前。
     """
+    _p = _safe_print
     info = get_db_backend_info()
     backend = info["backend"]
-    bar = "═" * 62
-    print(f"\n{bar}")
-    print(f"  {header}")
-    print(f"{bar}")
-    print(f"  当前后端: {backend}")
+    bar = "=" * 62
+    _p(f"\n{bar}")
+    _p(f"  {header}")
+    _p(f"{bar}")
+    _p(f"  当前后端: {backend}")
     if "MySQL" in backend:
-        print(f"  Host:     {info.get('host','')}:{info.get('port','')}")
-        print(f"  DB:       {info.get('database','')}")
-        print(f"  User:     {info.get('user','')}")
-        print(f"  降级机制: 外网断开自动切 SQLite (日志/控制台会打出 [DB 降级] 横幅)")
+        _p(f"  Host:     {info.get('host','')}:{info.get('port','')}")
+        _p(f"  DB:       {info.get('database','')}")
+        _p(f"  User:     {info.get('user','')}")
+        _p(f"  降级机制: 外网断开自动切 SQLite (日志/控制台会打出 [DB 降级] 横幅)")
     else:
-        print(f"  SQLite:   {info.get('path','')}")
+        _p(f"  SQLite:   {info.get('path','')}")
         if info.get("note"):
-            print(f"  ⚠️  注意:   {info['note']}")
-    print(f"{bar}")
+            _p(f"  [!] 注意:   {info['note']}")
+    _p(f"{bar}")
 
 
 def test_mysql_connection() -> dict:

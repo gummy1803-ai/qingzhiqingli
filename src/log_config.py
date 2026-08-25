@@ -77,11 +77,20 @@ def _force_utf8_console() -> tuple[bool, str]:
             stream = getattr(sys, stream_name, None)
             if stream is None:
                 continue
-            if hasattr(stream, "buffer") and not isinstance(stream, io.TextIOWrapper):
-                # 检查是否已经是 UTF-8 编码
-                if hasattr(stream, "encoding") and stream.encoding and stream.encoding.lower() == "utf-8":
-                    continue  # 已经是 UTF-8,无需包装
 
+            # 已经是 UTF-8 就跳过
+            cur_enc = getattr(stream, "encoding", "") or ""
+            if cur_enc.lower().replace("-", "") == "utf8":
+                continue
+
+            # 优先用 reconfigure (Python 3.7+, 最安全)
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+                wrapped_count += 1
+                continue
+
+            # 回退: 用 buffer 重新包装
+            if hasattr(stream, "buffer"):
                 wrapped = io.TextIOWrapper(
                     stream.buffer,
                     encoding="utf-8",
@@ -93,11 +102,11 @@ def _force_utf8_console() -> tuple[bool, str]:
 
         if wrapped_count > 0:
             wrap_ok = True
-            results.append(f"流包装成功: 包装了 {wrapped_count} 个流为 UTF-8")
+            results.append(f"流编码修复成功: 修复了 {wrapped_count} 个流为 UTF-8")
         else:
-            results.append("流无需包装 (已是UTF-8或无buffer)")
+            results.append("流无需修复 (已是UTF-8或无buffer)")
     except Exception as e:
-        results.append(f"流包装异常: {e}")
+        results.append(f"流编码修复异常: {e}")
 
     # 汇总结果
     _encoding_fixed = api_ok or wrap_ok or True  # 至少环境变量已设置

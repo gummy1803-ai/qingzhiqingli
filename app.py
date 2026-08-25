@@ -75,40 +75,57 @@ print_console_db_status("Streamlit 启动 · DB 初始化状态")
 from src.metrics import _safe_num
 from src.data_quality import classify_risk
 
+def _safe_print(*args, **kwargs):
+    """Windows GBK 控制台安全 print: emoji 自动降级为 ASCII。"""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        safe_args = []
+        for a in args:
+            if isinstance(a, str):
+                safe_args.append(a.encode("ascii", errors="replace").decode("ascii"))
+            else:
+                safe_args.append(a)
+        try:
+            print(*safe_args, **kwargs)
+        except Exception:
+            pass
+
+
 def _app_precheck_banner() -> None:
     """Streamlit 启动期, 在终端输出与 run_e2e.py 对齐的预检横幅。
 
-    ⚠️  性能考虑 (Streamlit 每轮 rerun 都会重跑本脚本的顶层代码):
+    性能考虑 (Streamlit 每轮 rerun 都会重跑本脚本的顶层代码):
     - 车辆预检只做目录级元数据统计 (目录名 + CSV 数量), 不读任何 CSV 列内容
-      → 20 辆车也在毫秒级完成, 每轮 rerun 无压力。
-    - 飞书预检是纯 DB 读取 <100ms, 每轮跑也 OK (还可以自动感知 DB 变化)。
+    - 飞书预检是纯 DB 读取 <100ms, 每轮跑也 OK
 
     真正的「0 占比 / 风险等级」全量扫描请在 Streamlit 页面的台架预警 Tab,
     或命令行运行 python scan_hyd_zero.py。
     """
+    _p = _safe_print
     ROOT = Path(__file__).resolve().parent
     CSV_BASE = ROOT / "企业资料包02_氢质氢离" / "02_整车数据处理"
-    bar = "─" * 70
-    print("\n" + bar)
-    print("  Streamlit 启动预检 · 整车目录自动识别 (新增车型 ← 这里自动看到)")
-    print(bar)
+    bar = "-" * 70
+    _p("\n" + bar)
+    _p("  Streamlit 启动预检 · 整车目录自动识别 (新增车型 ← 这里自动看到)")
+    _p(bar)
     if CSV_BASE.exists():
         car_dirs = sorted([d for d in CSV_BASE.iterdir() if d.is_dir()])
-        print(f"  扫描目录: {CSV_BASE}")
-        print(f"  自动识别车辆数: {len(car_dirs)}")
-        header = f"  {'车辆':<10}{'CSV分片数':>12}  ✅ = 已被纳入 run_e2e / 页面下拉菜单"
-        print("  " + "-" * (len(header) + 8))
-        print(header)
+        _p(f"  扫描目录: {CSV_BASE}")
+        _p(f"  自动识别车辆数: {len(car_dirs)}")
+        header = f"  {'车辆':<10}{'CSV分片数':>12}  [OK] = 已被纳入 run_e2e / 页面下拉菜单"
+        _p("  " + "-" * (len(header) + 8))
+        _p(header)
         total_csv = 0
         for car_dir in car_dirs:
             files = sorted(car_dir.glob("*.csv"))
             total_csv += len(files)
-            print(f"  {car_dir.name:<10} {len(files):>12}  ✅")
-        print("-" * 20)
-        print(f"  合计 CSV 分片: {total_csv}")
+            _p(f"  {car_dir.name:<10} {len(files):>12}  [OK]")
+        _p("-" * 20)
+        _p(f"  合计 CSV 分片: {total_csv}")
     else:
-        print(f"  ⚠ 内置 CSV 目录不存在: {CSV_BASE}")
-        print("     可在 Streamlit 侧边栏选择「上传文件」模式导入。")
+        _p(f"  [!] 内置 CSV 目录不存在: {CSV_BASE}")
+        _p("     可在 Streamlit 侧边栏选择「上传文件」模式导入。")
 
     # ---------- 飞书联系人预检 ----------
     try:
@@ -119,23 +136,21 @@ def _app_precheck_banner() -> None:
         )
         contacts = _feishu_list()
         info = get_db_backend_info()
-        print(bar)
-        print("  Streamlit 启动预检 · 飞书人员对接 (新增联系人 ← 这里自动看到)")
-        print(bar)
-        print(f"  存储后端: {info.get('backend_display', info.get('backend', 'N/A'))}")
+        _p(bar)
+        _p("  Streamlit 启动预检 · 飞书人员对接 (新增联系人 ← 这里自动看到)")
+        _p(bar)
+        _p(f"  存储后端: {info.get('backend_display', info.get('backend', 'N/A'))}")
         if info.get("backend") == "mysql":
-            print(f"  Host: {info.get('host')}:{info.get('port')}  DB: {info.get('dbname')}  User: {info.get('user')}")
-            print(f"  🔁 降级: MySQL 外网断开会自动切 SQLite (终端/日志会打印 [DB 降级] 横幅)")
-        print("-" * 30)
+            _p(f"  Host: {info.get('host')}:{info.get('port')}  DB: {info.get('dbname')}  User: {info.get('user')}")
+            _p(f"  [LOOP] 降级: MySQL 外网断开会自动切 SQLite (终端/日志会打印 [DB 降级] 横幅)")
+        _p("-" * 30)
         if not contacts:
-            print("  ⚠ 还没有任何飞书联系人 → 进入 📡 飞书人员对接 Tab 新增")
+            _p("  [!] 还没有任何飞书联系人 → 进入 [FEISHU] 飞书人员对接 Tab 新增")
         else:
             verified_cnt = sum(1 for c in contacts if c.get("verified"))
             enabled_cnt = sum(1 for c in contacts if c.get("enabled", True))
-            print(f"  总联系人: {len(contacts)} | 启用: {enabled_cnt} | 已验证(飞书推送绿灯): {verified_cnt}")
-            # ✅ 自动检测密钥是否过期 (Streamlit Cloud / 本机启动都自动打一次)
-            # ⚠️  用线程池强制超时 8 秒 (Cloud 外网到飞书 API 可能慢, 不能卡启动)
-            print("-" * 10 + " 🔑 密钥预检开始 (超时8秒自动跳过) " + "-" * 20)
+            _p(f"  总联系人: {len(contacts)} | 启用: {enabled_cnt} | 已验证(飞书推送绿灯): {verified_cnt}")
+            _p("-" * 10 + " [KEY] 密钥预检开始 (超时8秒自动跳过) " + "-" * 20)
             _key_result = None
             try:
                 import concurrent.futures as _fut
@@ -143,11 +158,11 @@ def _app_precheck_banner() -> None:
                     _future = _pool.submit(_detect_creds)
                     _key_result = _future.result(timeout=8)
             except _fut.TimeoutError:
-                print("  ⏱ 密钥预检超时(>8秒,外网到飞书慢) → 已跳过,可进入飞书人员对接Tab手动触发")
+                _p("  [TIME] 密钥预检超时(>8秒,外网到飞书慢) → 已跳过,可进入飞书人员对接Tab手动触发")
                 logger.warning("[Streamlit启动预检·密钥] 超时>8秒自动跳过(Cloud外网到飞书慢)")
                 _key_result = None
             except Exception as e:
-                print(f"  ⚠ 密钥预检失败(不影响页面主功能): {e}")
+                _p(f"  [!] 密钥预检失败(不影响页面主功能): {e}")
                 logger.warning("[Streamlit启动预检·密钥] 失败: %s", e, exc_info=True)
                 _key_result = None
             if _key_result is not None:
@@ -160,8 +175,8 @@ def _app_precheck_banner() -> None:
                     len(result.get("app_group_results", [])),
                     int(result.get("total_elapsed_ms", 0)), summary,
                 )
-                print(
-                    f"  📊 汇总 | 有效={summary.get('valid',0)} 失效={summary.get('invalid',0)} "
+                _p(
+                    f"  [STAT] 汇总 | 有效={summary.get('valid',0)} 失效={summary.get('invalid',0)} "
                     f"超时={summary.get('timeout',0)} 网络错={summary.get('network_err',0)} "
                     f"跳过禁用={summary.get('skipped_disabled',0)}"
                 )
@@ -170,22 +185,22 @@ def _app_precheck_banner() -> None:
                     cid = c.get("id")
                     name = c.get("name", "")
                     app_id = c.get("app_id", "")
-                    en = "✅" if c.get("enabled", True) else "🔲"
-                    vf = "✅" if c.get("verified") else "🔲"
+                    en = "[ON]" if c.get("enabled", True) else "[OFF]"
+                    vf = "[V]" if c.get("verified") else "[--]"
                     if cid in per:
                         c_info = per[cid]
                         st_line = _creds_text(c_info.get("status"), c_info.get("code"))
                         el_ms = c_info.get("elapsed_ms", 0)
                         oid = c.get("open_id", "") or ""
                         oid_m = oid[:10] + "..." if len(oid) > 10 else oid
-                        print(f"    · {name:<10} 启用={en} 验证={vf}  {app_id:<14} open_id={oid_m:<16}   {st_line} ({el_ms:.0f}ms)")
+                        _p(f"    · {name:<10} 启用={en} 验证={vf}  {app_id:<14} open_id={oid_m:<16}   {st_line} ({el_ms:.0f}ms)")
                     else:
-                        print(f"    · {name:<10} 启用={en} 验证={vf}  {app_id:<14}  🔑 N/A (跳过)")
-                print(f"[密钥巡检] ✅ 完成 (总耗时={int(result.get('total_elapsed_ms',0))}ms, cache_age={age:.1f}s)")
+                        _p(f"    · {name:<10} 启用={en} 验证={vf}  {app_id:<14}  [KEY] N/A (跳过)")
+                _p(f"[密钥巡检] [OK] 完成 (总耗时={int(result.get('total_elapsed_ms',0))}ms, cache_age={age:.1f}s)")
     except Exception as e:
         logger.warning("[Streamlit启动预检] 飞书模块加载失败, 跳过飞书预检: %s", e, exc_info=True)
-        print(f"  ⚠ 飞书模块加载失败(不影响页面主功能): {e}")
-    print(bar + "\n")
+        _p(f"  [!] 飞书模块加载失败(不影响页面主功能): {e}")
+    _p(bar + "\n")
 
 
 # Streamlit 每轮 rerun 都会重跑模块顶层;这里用全局锁确保「终端预检横幅」只打印一次。
