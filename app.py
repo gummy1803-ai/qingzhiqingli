@@ -239,7 +239,7 @@ from src.plots import (
     fig_power_curve,
     fig_speed_hydrogen,
 )
-from src.report import build_report_html
+from src.report import build_report_html, generate_vehicle_report
 from datetime import datetime
 
 from components.filter_bar import render_filter_bar
@@ -2976,58 +2976,126 @@ def _render_tab_report(
     cars: list[str],
     data: dict[str, pd.DataFrame],
 ) -> None:
-    """Tab6: 报告导出。"""
+    """Tab6: 报告导出 (统一入口: 车辆选择 + 双格式 + 预览)。"""
     st.subheader("📄 一键生成测试报告")
-    st.caption("基于当前已加载的整车数据,一键导出 HTML 格式测试报告(可 Ctrl+P 打印为 PDF)")
+    st.caption("基于已加载的整车数据，一键导出 HTML / Word 报告；HTML 打开后 Ctrl+P 可打印为高清 PDF")
     st.markdown("---")
 
     has_data = bool(cars) and bool(data)
-    if not has_data:
-        _render_empty_state(
-            title="暂无可导出的整车数据",
-            desc="需要至少 1 辆已加载的整车 CSV 数据,才能运行 HTML 报告生成流程。",
-            action_hint="侧边栏上传整车 CSV / 切换内置数据模式 → 回到此处点「生成报告」",
-            icon="📑",
-        )
+
+    # ---- 配置卡片 ----
+    with st.container(border=True):
+        cols_cfg = st.columns([3, 2, 1])
+        with cols_cfg[0]:
+            default_car = cars[0] if cars else None
+            rep_car = st.selectbox(
+                "🚗 选择要生成报告的车辆", cars,
+                index=0 if cars else 0,
+                disabled=not has_data,
+                key="rep_car_select",
+            )
+        with cols_cfg[1]:
+            rep_fmt_label = st.selectbox(
+                "📋 报告格式",
+                ["HTML (可打印为PDF)", "Word (.docx)"],
+                disabled=not has_data,
+                key="rep_fmt_select",
+            )
+        with cols_cfg[2]:
+            st.caption("")  # 占位
+            do_preview = st.checkbox("页面内预览", value=True, key="rep_preview")
+        rep_fmt = "html" if "HTML" in rep_fmt_label else "docx"
 
     st.markdown("### 🚀 执行生成")
     if not has_data:
-        st.button("生成 HTML 报告(浏览器 Ctrl+P 可打印为 PDF)",
-                  type="primary", disabled=True)
-        _render_empty_state("等待数据加载后即可生成",
-                            desc="无数据时按钮禁用,避免报错。",
-                            action_hint="加载 1 辆车数据后按钮自动启用",
-                            icon="⏳")
-    elif st.button("生成 HTML 报告(浏览器 Ctrl+P 可打印为 PDF)", type="primary"):
-        rep_car = cars[0]
+        _render_empty_state(
+            title="暂无可导出的整车数据",
+            desc="需要至少 1 辆已加载的整车 CSV 数据,才能运行报告生成流程。",
+            action_hint="侧边栏上传整车 CSV / 切换内置数据模式 → 回到此处点「生成报告」",
+            icon="📑",
+        )
+    else:
         if rep_car not in data or len(data[rep_car]) == 0:
-            _render_empty_state(f"车辆 {rep_car} 对应数据为空",
-                                action_hint="检查数据字典中是否存在该车辆的 DataFrame",
-                                icon="⚠️")
-        else:
+            st.error(f"车辆 {rep_car} 对应数据为空，请检查数据加载状态")
+        elif st.button("✨ 生成报告并下载", type="primary", use_container_width=True):
             rep_df = data[rep_car]
-            logger.info("=== 生成 HTML 报告: 车辆=%s 数据=%d 行 ===", rep_car, len(rep_df))
+            logger.info("[报告导出Tab] 开始生成: 车辆=%s 数据=%d 行 fmt=%s",
+                        rep_car, len(rep_df), rep_fmt)
             try:
-                rep_ov = vehicle_overview(rep_df)
-                html = build_report_html(
-                    vehicle=rep_car,
-                    df=rep_df,
-                    overview=rep_ov,
-                    cell_consist=cell_voltage_consistency(rep_df),
-                    power=power_summary(rep_df),
-                    h2=h2_system(rep_df),
-                )
-                logger.info("HTML 报告生成完成: %d 字节", len(html))
-                st.download_button(
-                    "下载 HTML 报告",
-                    data=html.encode("utf-8"),
-                    file_name=f"测试报告_{rep_car}.html",
-                    mime="text/html",
-                )
-                st.components.v1.html(html, height=800, scrolling=True)
+                with st.spinner("正在计算指标 + 生成图表，请稍候..."):
+                    fname, content = generate_vehicle_report(
+                        vehicle=rep_car,
+                        df=rep_df,
+                        fmt=rep_fmt,
+                    )
+                st.success(f"✅ 报告生成完成: `{fname}`")
+
+                # 下载按钮 (并排)
+                dl_cols = st.columns([1, 1, 2])
+                with dl_cols[0]:
+                    if rep_fmt == "html":
+                        st.download_button(
+                            "⬇️ 下载 HTML 报告",
+                            data=content.encode("utf-8"),
+                            file_name=fname,
+                            mime="text/html",
+                            use_container_width=True,
+                            help="浏览器打开后 Ctrl+P 可打印为高清 PDF",
+                            key="tabrep_dl_html",
+                        )
+                    else:
+                        st.download_button(
+                            "⬇️ 下载 Word 报告",
+                            data=content,
+                            file_name=fname,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True,
+                            help="Word 格式；若环境无 kaleido，静态图会跳过，建议同时下载 HTML 版",
+                            key="tabrep_dl_docx",
+                        )
+                with dl_cols[1]:
+                    # 同步生成另一种格式供对比
+                    other_fmt = "docx" if rep_fmt == "html" else "html"
+                    with st.spinner(f"同步生成 {other_fmt.upper()} 版本..."):
+                        try:
+                            fname2, content2 = generate_vehicle_report(
+                                vehicle=rep_car, df=rep_df, fmt=other_fmt,
+                            )
+                            if other_fmt == "html":
+                                st.download_button(
+                                    f"⬇️ 也下载 HTML",
+                                    data=content2.encode("utf-8"),
+                                    file_name=fname2, mime="text/html",
+                                    use_container_width=True, key="tabrep_dl_html2",
+                                )
+                            else:
+                                st.download_button(
+                                    f"⬇️ 也下载 DOCX",
+                                    data=content2, file_name=fname2,
+                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                    use_container_width=True, key="tabrep_dl_docx2",
+                                )
+                        except Exception as e2:
+                            st.warning(f"另一种格式生成失败(不影响主下载): {str(e2)[:80]}")
+
+                # 预览 (仅 HTML)
+                if do_preview:
+                    if rep_fmt == "html":
+                        st.markdown("---")
+                        st.markdown("#### 👁️ 报告预览 (页面内,滚动查看)")
+                        st.components.v1.html(content, height=900, scrolling=True)
+                    else:
+                        # docx: 预览 HTML 等价版本
+                        st.markdown("---")
+                        st.markdown("#### 👁️ 报告预览 (Word 不支持页面内预览,以下为 HTML 等价版本)")
+                        with st.spinner("生成 HTML 预览..."):
+                            _, html_preview = generate_vehicle_report(
+                                vehicle=rep_car, df=rep_df, fmt="html",
+                            )
+                            st.components.v1.html(html_preview, height=900, scrolling=True)
             except Exception as e:
-                logger.error("HTML 报告生成失败: %s", e, exc_info=True)
-                st.error(f"报告生成失败: {e}")
+                logger.error("[报告导出Tab] 生成失败: %s", e, exc_info=True)
+                st.error(f"报告生成失败: {str(e)[:300]}")
 
 
 @tab_safe_render
@@ -3626,9 +3694,57 @@ def _render_tab_fc(
     )
     st.caption("© 2026 燃料电池监控系统 | 数据更新频率: 1s")
 
-    _c1, _c2, _c3 = st.columns([8, 1, 2])
-    if _c3.button("📄 导出报告", key="fc_export_btn", use_container_width=True):
-        st.info("导出报告功能开发中(占位)")
+    # ---- 📄 导出报告 (燃电看板底部) ----
+    _c1, _c2, _c3 = st.columns([5, 2, 3])
+    with _c2:
+        export_fmt = st.selectbox(
+            "报告格式", ["HTML (可打印PDF)", "Word (.docx)"],
+            key="fc_export_fmt", label_visibility="collapsed",
+        )
+    if _c3.button("📄 导出报告", key="fc_export_btn", type="primary", use_container_width=True):
+        # 确定要导出的 DataFrame
+        export_df = None
+        if st.session_state.get("fc_processed_df") is not None and len(st.session_state["fc_processed_df"]) > 0:
+            export_df = st.session_state["fc_processed_df"]
+        elif (not use_mock) and (not use_test_csv) and vehicle_id in data and len(data[vehicle_id]):
+            export_df = data[vehicle_id].copy()
+        elif use_mock:
+            export_df = generate_mock_data(vehicle_id, pd.Timestamp(start_dt), pd.Timestamp(end_dt))
+
+        if export_df is None or len(export_df) == 0:
+            st.warning("当前无可用数据,请先加载或上传数据后再导出")
+        else:
+            try:
+                fmt_code = "html" if "HTML" in export_fmt else "docx"
+                with st.spinner(f"正在生成 {export_fmt} 报告 (计算指标+生成图表)..."):
+                    fname, content = generate_vehicle_report(
+                        vehicle_id, export_df, fmt=fmt_code,
+                    )
+                st.success(f"报告生成完成: {fname}")
+
+                if fmt_code == "html":
+                    st.download_button(
+                        "⬇️ 下载 HTML 报告",
+                        data=content.encode("utf-8"),
+                        file_name=fname,
+                        mime="text/html",
+                        use_container_width=True,
+                        key="fc_dl_html",
+                        help="浏览器打开后 Ctrl+P 可打印为高清 PDF",
+                    )
+                else:
+                    st.download_button(
+                        "⬇️ 下载 Word 报告",
+                        data=content,
+                        file_name=fname,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True,
+                        key="fc_dl_docx",
+                        help="无 kaleido 时 Word 中不含静态图,建议配合 HTML 版使用",
+                    )
+            except Exception as e:
+                logger.error("[燃电看板-导出报告] 失败: %s", e, exc_info=True)
+                st.error(f"生成报告失败: {str(e)[:200]}")
 
 
 @tab_safe_render
@@ -3862,8 +3978,10 @@ def _render_tab_performance(
                 "⬇️ 导出段统计 CSV", _exp.to_csv(index=False).encode("utf-8"),
                 file_name=f"performance_{vehicle_id}_{datetime.now():%Y%m%d_%H%M}.csv",
                 mime="text/csv",
+                use_container_width=True,
             )
-            st.caption("PDF 报告导出功能开发中(占位)")
+            st.markdown("---")
+            st.caption("整车综合报告 (KPI+图表) 请到「📊 燃电运行看板」底部点击「导出报告」按钮，支持 HTML(可打印PDF) 和 Word(.docx) 两种格式。")
 
 
 @tab_safe_render
